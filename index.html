@@ -386,6 +386,7 @@ function startGame(opts) {
     shake: 0, hitFlash: null, msgShow: null, lastMsgId: -1, confetti: [], time: 0,
   };
   paused = false;
+  NET.rem = null;
   for (const k in pressed) delete pressed[k];
   hideAll();
   G3.onGameStart();
@@ -555,7 +556,7 @@ function handoff() {
   const b = game.ball;
   game.X++; game.knownX = game.X; game.ownBall = false;
   b.owner = sideOfX(b.x);
-  NET.ho = { r: game.gs.rally, X: game.X, s: [r3(b.x), r3(b.y), r3(b.vx), r3(b.vy), r3(b.sp || 0)], h: b.hitter, b: b.bounces, sv: b.serve ? 1 : 0, hc: b.hc, ls: b.lastSmash ? 1 : 0 };
+  NET.ho = { r: game.gs.rally, X: game.X, ts: Math.round(now()), s: [r3(b.x), r3(b.y), r3(b.vx), r3(b.vy), r3(b.sp || 0)], h: b.hitter, b: b.bounces, sv: b.serve ? 1 : 0, hc: b.hc, ls: b.lastSmash ? 1 : 0 };
 }
 
 // ---------- Slag ----------
@@ -1558,18 +1559,19 @@ function applyQuality() {
   const cssW = Math.max(1, r.width), cssH = Math.max(1, r.height);
   const dpr = window.devicePixelRatio || 1;
   let pr;
-  if (settings.gfx === 2) pr = 3840 / cssW;            // rendrer alltid i 3840×2160
+  if (settings.gfx === 2) pr = 3840 / cssW;            // rendrer i 3840×2160 …
   else if (settings.gfx === 1) pr = Math.min(dpr, 2560 / cssW);
   else pr = Math.min(dpr, 1) * 0.8;
+  if (settings.gfx > 0) pr *= PERF.dyn;                  // … men senker automatisk hvis maskinen ikke holder 60 bilder/s
   G3.renderer.setPixelRatio(pr);
   G3.renderer.setSize(cssW, cssH, false);
-  const ms = [1024, 2048, 4096][settings.gfx];
+  const ms = [1024, 2048, 2048][settings.gfx];
   if (G3.sun.shadow.mapSize.x !== ms) { G3.sun.shadow.mapSize.set(ms, ms); if (G3.sun.shadow.map) { G3.sun.shadow.map.dispose(); G3.sun.shadow.map = null; } }
   const hud = document.getElementById('hud');
   const hpr = Math.min(Math.max(dpr, pr), 3840 / cssW);
   hud.width = Math.round(cssW * hpr); hud.height = Math.round(cssH * hpr);
   const size = G3.renderer.getDrawingBufferSize(new THREE.Vector2());
-  document.getElementById('resNote').textContent = 'Tegner i ' + size.x + '×' + size.y;
+  document.getElementById('resNote').textContent = 'Tegner i ' + size.x + '×' + size.y + (PERF.dyn < 0.99 ? ' (tilpasset for jevn flyt)' : '');
 }
 window.addEventListener('resize', () => applyQuality());
 
@@ -1617,7 +1619,9 @@ function render3D(dt, t) {
     // ball
     if (vb) {
       G3.ball.visible = true;
-      G3.ball.position.set(vb.x, vb.y, BALLZ);
+      let ox = 0, oy = 0;
+      if (game.ownBall && game.ownErr) { const k = Math.pow(0.002, dt); game.ownErr.x *= k; game.ownErr.y *= k; ox = game.ownErr.x; oy = game.ownErr.y; if (Math.hypot(ox, oy) < 0.005) game.ownErr = null; }
+      G3.ball.position.set(vb.x + ox, vb.y + oy, BALLZ);
       G3.ball.rotation.z = -(vb.spin || 0);
       G3.ballShadow.position.set(vb.x, 0.026, BALLZ);
       const sc = clamp(1 - vb.y / 6, 0.25, 1); G3.ballShadow.scale.setScalar(sc); G3.ballShadow.material.opacity = sc;
@@ -1757,8 +1761,19 @@ function drawHUD() {
 //  Hovedløkke
 // ====================================================================
 let lastT = 0;
+const PERF = { acc: 0, n: 0, dyn: 1 };
 function loop(t) {
   const dt = Math.min(0.05, (t - (lastT || t)) / 1000); lastT = t;
+  PERF.acc += dt; PERF.n++;
+  if (PERF.acc >= 1) {
+    const avg = PERF.acc / PERF.n * 1000;
+    if (settings.gfx > 0 && G3.ready && document.visibilityState === 'visible') {
+      let nd = PERF.dyn;
+      if (avg > 18.5) nd = Math.max(0.4, nd * 0.85); else if (avg < 14 && nd < 1) nd = Math.min(1, nd * 1.08);
+      if (Math.abs(nd - PERF.dyn) > 0.01) { PERF.dyn = nd; applyQuality(); }
+    }
+    PERF.acc = 0; PERF.n = 0;
+  }
   try {
     if (game && game.mode === 'online') updateRemote(dt);
     if (game && !(paused && game.mode !== 'online')) update(dt);
@@ -1902,7 +1917,7 @@ const BROKERS = [
   { url: 'wss://test.mosquitto.org:8081/mqtt' },
   { url: 'wss://broker.hivemq.com:8884/mqtt' },
 ];
-const VERSION = '3.3';
+const VERSION = '3.4';
 function makeRelayRoom() {
   const myPeer = 'p' + Math.random().toString(36).slice(2, 10);
   let mine = {}, other = null, clients = [], topic = null, lastSend = 0, pending = false, seq = 0, otherSeq = -1, lockPeer = null, waiter = null, wasConn = false;
@@ -2176,9 +2191,9 @@ function netSend(force) {
   const me = game.players[game.mySide];
   const b = game.ball;
   NET.room.presence({
-    v: 2, nm: myName(), st: 'play', opp: NET.opp, tg: NET.target, lk: looks[0], q: NET.seq,
+    v: 2, nm: myName(), st: 'play', opp: NET.opp, tg: NET.target, lk: looks[0], q: NET.seq, ts: Math.round(now()),
     pl: [r3(me.x), r3(me.y), r3(me.vx), r3(me.vy), Math.round(me.swT * 1000), me.swOver ? 1 : 0, me.onGround ? 1 : 0, Math.round(Math.max(0, me.hitT) * 1000), r3(me.run % 1000)],
-    ball: game.ownBall ? { r: game.gs.rally, X: game.X, q: NET.seq, s: [r3(b.x), r3(b.y), r3(b.vx), r3(b.vy), r3(b.sp || 0)], hd: b.held ? 1 : 0, h: b.hitter } : null,
+    ball: game.ownBall ? { r: game.gs.rally, X: game.X, q: NET.seq, s: [r3(b.x), r3(b.y), r3(b.vx), r3(b.vy), r3(b.sp || 0)], hd: b.held ? 1 : 0, h: b.hitter, hc: b.hc } : null,
     ho: NET.ho, end: NET.end, fx: NET.fx, fk: NET.fk,
     gs: game.auth ? game.gs : null,
   }).catch(() => {});
@@ -2202,62 +2217,117 @@ function netUpdate(dt) {
       if (newRally) { localStartRally(); NET.ho = null; NET.end = null; }
     }
     if (game.auth && pr.end && pr.end.r === game.gs.rally) authEnd(pr.end.r, pr.end.w, String(pr.end.k));
-    const ho = pr.ho;
-    if (ho && ho.r === game.gs.rally && ho.X > game.knownX && Array.isArray(ho.s) && ho.s.every(Number.isFinite)) {
-      const b = game.ball;
-      b.x = ho.s[0]; b.y = ho.s[1]; b.vx = ho.s[2]; b.vy = ho.s[3]; b.sp = clamp(ho.s[4] || 0, -1, 1);
-      b.hitter = ho.h === 0 || ho.h === 1 ? ho.h : -1; b.bounces = ho.b | 0; b.serve = !!ho.sv; b.hc = ho.hc | 0; b.lastSmash = !!ho.ls; b.held = false; b._rolled = false;
-      b.owner = game.mySide; game.ownBall = true; game.X = game.knownX = ho.X; game.rb = null;
-      if (rallyLive()) { const ahead = Math.min(0.06, (now() - opp.updatedAt) / 1000); for (let t = 0; t < ahead && game.ownBall; t += STEP) physStep(b, STEP, ballEvent); }
-    }
-    if (typeof pr.fx === 'number' && pr.fx !== NET.lastFx) { if (NET.lastFx >= 0) { if (pr.fk) { SFX.smash(); game.shake = 0.2; } else SFX.hit(); } NET.lastFx = pr.fx; }
+    maybeTakeHandoff(pr.ho);
   }
   netSend(false);
 }
+// ---- Jevn visning av motspilleren (snapshot-interpolering) ----
+// Hver melding har avsenderens klokke (ts). Vi viser motspilleren DELAY ms bak,
+// interpolert mellom to meldinger, slik at ujevn nettforsinkelse ikke gir rykk.
+// Ballen på motspillerens side regnes ut lokalt fra hvert slag (samme fysikk på begge maskiner).
+const DELAY = 110;
+function remoteState() {
+  return NET.rem || (NET.rem = { buf: [], lastQ: -1, off: null, bev: [], sim: null, simKey: '', fxq: [], lastFx: null, pendingHo: null });
+}
+// Ballens tid: avsenderens klokke nå (minus minste nettforsinkelse). Kroppen vises DELAY ms bak dette.
+function remoteRenderTime() { const R = remoteState(); return R.off === null ? null : now() - R.off; }
+function ingestRemote(pr) {
+  const R = remoteState();
+  if (pr.q === R.lastQ || !Number.isFinite(pr.ts) || !Array.isArray(pr.pl) || pr.pl.length < 7 || !pr.pl.every(Number.isFinite)) return;
+  R.lastQ = pr.q;
+  const d = now() - pr.ts;
+  R.off = R.off === null ? d : Math.min(d, R.off + 0.4);
+  R.buf.push({ ts: pr.ts, pl: pr.pl }); if (R.buf.length > 40) R.buf.shift();
+  const rb = pr.ball;
+  if (rb && Array.isArray(rb.s) && rb.s.every(Number.isFinite)) {
+    const key = rb.r + ':' + rb.X + ':' + (rb.hc | 0) + ':' + (rb.hd ? 1 : 0);
+    const last = R.bev[R.bev.length - 1];
+    if (!last || last.key !== key) { R.bev.push({ key, ts: pr.ts, r: rb.r, X: rb.X, hc: rb.hc | 0, held: !!rb.hd, s: rb.s.slice() }); if (R.bev.length > 16) R.bev.shift(); }
+  }
+  if (typeof pr.fx === 'number') {
+    if (R.lastFx === null) R.lastFx = pr.fx;
+    else if (pr.fx !== R.lastFx) { R.lastFx = pr.fx; R.fxq.push({ ts: pr.ts, smash: !!pr.fk }); }
+  }
+}
+
 function updateRemote(dt) {
   const opp = getOpp(); if (!opp || !game) return;
   const pr = opp.presence || {};
-  const side = 1 - game.mySide;
-  const p = game.players[side];
-  const age = clamp((now() - opp.updatedAt) / 1000, 0, 0.15);
-  if (Array.isArray(pr.pl) && pr.pl.length >= 7 && pr.pl.every(Number.isFinite)) {
-    const [x, y, vx, vy, sw, ov, og, ht, run] = pr.pl;
-    const tx = clamp(x + vx * age, XRANGE[side][0], XRANGE[side][1]);
-    const ty = Math.max(0, y + vy * age - (og ? 0 : 0.5 * PG * age * age));
-    p.x = x; p.y = y; p.vx = vx; p.vy = vy; p.onGround = !!og;
-    const kk = 1 - Math.pow(0.0005, dt);
-    p.rx = lerp(p.rx, tx, kk); p.ry = lerp(p.ry, ty, kk);
-    if (Math.abs(p.rx - tx) > 3) p.rx = tx;
-    if (og) p.run += dt * Math.abs(vx) * 2.0;
-    p.swOver = !!ov;
-    if (sw > 0) { p.swT = sw / 1000 + age; if (p.swT > SW_DUR) p.swT = 0; p.hitT = ht > 0 ? ht / 1000 : -1; p.hitDone = ht > 0; }
-    else if (p.swT > 0) { p.swT += dt; if (p.swT > SW_DUR) { p.swT = 0; p.hitT = -1; } }
+  const R = remoteState();
+  ingestRemote(pr);
+  const side = 1 - game.mySide, p = game.players[side];
+  const rtB = remoteRenderTime();
+  if (rtB === null || !R.buf.length) return;
+  const rt = rtB - DELAY;
+  // --- motspilleren (posisjon jevnt interpolert) ---
+  const buf = R.buf;
+  let a = buf[0], b = null;
+  for (let i = 0; i < buf.length; i++) { if (buf[i].ts <= rt) a = buf[i]; else { b = buf[i]; break; } }
+  let x, y, vx;
+  if (b && a.ts <= rt && b.ts > a.ts) {
+    const k = (rt - a.ts) / (b.ts - a.ts);
+    x = lerp(a.pl[0], b.pl[0], k); y = lerp(a.pl[1], b.pl[1], k); vx = lerp(a.pl[2], b.pl[2], k);
+  } else {
+    const e = clamp((rt - a.ts) / 1000, 0, 0.12);
+    x = a.pl[0] + a.pl[2] * e; y = Math.max(0, a.pl[1] + a.pl[3] * e - (a.pl[6] ? 0 : 0.5 * PG * e * e)); vx = a.pl[2];
   }
-  const rb = pr.ball;
-  if (!game.ownBall && rb && rb.r === game.gs.rally && rb.X === game.knownX && Array.isArray(rb.s) && rb.s.every(Number.isFinite)) {
-    if (rb.q !== game.rbSeq) {
-      game.rbSeq = rb.q;
-      const nb = { x: rb.s[0], y: rb.s[1], vx: rb.s[2], vy: rb.s[3], sp: clamp(rb.s[4] || 0, -1, 1), held: !!rb.hd, owner: side, spin: game.rb ? game.rb.spin : 0 };
-      if (!nb.held) for (let t = 0; t < age; t += STEP) physStep(nb, STEP, null);
-      if (game.rb && !game.rb.held && !nb.held) {
-        game.rbErr.x += game.rb.sx - nb.x; game.rbErr.y += game.rb.sy - nb.y;
-        if (Math.hypot(game.rbErr.x, game.rbErr.y) > 2.5) game.rbErr.x = game.rbErr.y = 0;
-      } else game.rbErr.x = game.rbErr.y = 0;
-      nb.sx = nb.x; nb.sy = nb.y;
-      nb.x = nb.sx + game.rbErr.x; nb.y = nb.sy + game.rbErr.y;
-      game.rb = nb;
-    } else if (game.rb && !game.rb.held) {
-      const r = game.rb;
-      const sim = { x: r.sx, y: r.sy, vx: r.vx, vy: r.vy, sp: r.sp, spin: r.spin };
-      const n = Math.max(1, Math.round(dt / STEP));
-      for (let i = 0; i < n; i++) physStep(sim, dt / n, e => { if (e === 'bounce') { SFX.bounce(); G3.bounceMark(sim.x); } if (e === 'net') SFX.net(); });
-      r.sx = sim.x; r.sy = sim.y; r.vx = sim.vx; r.vy = sim.vy; r.sp = sim.sp; r.spin = sim.spin;
-      const dk = Math.pow(0.0005, dt);
-      game.rbErr.x *= dk; game.rbErr.y *= dk;
-      r.x = r.sx + game.rbErr.x; r.y = r.sy + game.rbErr.y;
+  // slaget følger ballens tid, så racket og ball møtes
+  let sa = buf[0]; for (let i = 0; i < buf.length; i++) if (buf[i].ts <= rtB) sa = buf[i];
+  const sw = sa.pl[4], ov = sa.pl[5], og = a.pl[6], ht = sa.pl[7] || 0;
+  p.rx = clamp(x, XRANGE[side][0], XRANGE[side][1]); p.ry = y; p.x = p.rx; p.y = p.ry; p.vx = vx; p.onGround = !!og;
+  if (og) p.run += dt * Math.abs(vx) * 2.0;
+  p.swOver = !!ov;
+  const since = Math.max(0, rtB - sa.ts) / 1000;
+  if (sw > 0) { p.swT = sw / 1000 + since; if (p.swT > SW_DUR) p.swT = 0; p.hitT = ht > 0 ? ht / 1000 : -1; p.hitDone = ht > 0; }
+  else { p.swT = 0; p.hitT = -1; p.hitDone = false; }
+  // --- slaglyder i takt med bildet ---
+  while (R.fxq.length && R.fxq[0].ts <= rtB) { const f = R.fxq.shift(); if (f.smash) { SFX.smash(); game.shake = 0.2; } else SFX.hit(); }
+  // --- ballen på motspillerens side ---
+  if (game.ownBall) { R.simKey = ''; return; }
+  let ev = null;
+  for (const e of R.bev) if (e.ts <= rtB && e.r === game.gs.rally && e.X === game.knownX) ev = e;
+  if (!ev) { game.rb = null; return; }
+  if (ev.key !== R.simKey) {
+    const g0 = game.ball;
+    const prevVis = game.rb && !game.rb.held ? { x: game.rb.x, y: game.rb.y } : (!g0.held ? { x: g0.x, y: g0.y } : null);
+    const firstOfX = !R.simKey.startsWith(ev.r + ':' + ev.X + ':');
+    R.simKey = ev.key;
+    if (firstOfX && !ev.held && ev.hc === g0.hc && !g0.held) {
+      // samme ballbane som vi nettopp sendte over: fortsett vår egen jevne bane
+      R.sim = { x: g0.x, y: g0.y, vx: g0.vx, vy: g0.vy, sp: g0.sp || 0, spin: g0.spin || 0, held: false };
+      game.rbErr.x = game.rbErr.y = 0;
+    } else {
+    R.sim = { x: ev.s[0], y: ev.s[1], vx: ev.s[2], vy: ev.s[3], sp: clamp(ev.s[4] || 0, -1, 1), spin: R.sim ? R.sim.spin : 0, held: ev.held };
+    const ff = clamp((rtB - ev.ts) / 1000, 0, 0.25);
+    if (!R.sim.held) for (let t = 0; t < ff; t += STEP) physStep(R.sim, STEP, null);
+    if (prevVis && !R.sim.held) { game.rbErr.x = prevVis.x - R.sim.x; game.rbErr.y = prevVis.y - R.sim.y; if (Math.hypot(game.rbErr.x, game.rbErr.y) > 1.5) game.rbErr.x = game.rbErr.y = 0; }
+    else game.rbErr.x = game.rbErr.y = 0;
     }
-    if (game.rb && game.rb.held) { const hp = handPos(p); game.rb.x = hp.x; game.rb.y = hp.y; }
+  } else if (!R.sim.held) {
+    const n = Math.max(1, Math.round(dt / STEP));
+    for (let i = 0; i < n; i++) physStep(R.sim, dt / n, e => { if (e === 'bounce') { SFX.bounce(); G3.bounceMark(R.sim.x); } if (e === 'net') SFX.net(); });
   }
+  const dk = Math.pow(0.002, dt);
+  game.rbErr.x *= dk; game.rbErr.y *= dk;
+  const s = R.sim;
+  game.rb = { x: s.x + game.rbErr.x, y: s.y + game.rbErr.y, vx: s.vx, vy: s.vy, sp: s.sp, spin: s.spin, held: s.held, owner: side };
+  if (s.held) { const hp = handPos(p); game.rb.x = hp.x; game.rb.y = hp.y; }
+}
+
+// Overta ballen når den har krysset nettet – i takt med den forsinkede visningen
+function maybeTakeHandoff(ho) {
+  const R = remoteState();
+  if (!ho || ho.r !== game.gs.rally || ho.X <= game.knownX || !Array.isArray(ho.s) || !ho.s.every(Number.isFinite)) return;
+  const rt = remoteRenderTime();
+  const b = game.ball;
+  b.x = ho.s[0]; b.y = ho.s[1]; b.vx = ho.s[2]; b.vy = ho.s[3]; b.sp = clamp(ho.s[4] || 0, -1, 1);
+  b.hitter = ho.h === 0 || ho.h === 1 ? ho.h : -1; b.bounces = ho.b | 0; b.serve = !!ho.sv; b.hc = ho.hc | 0; b.lastSmash = !!ho.ls; b.held = false; b._rolled = false;
+  const vis = game.rb && !game.rb.held ? { x: game.rb.x, y: game.rb.y, spin: game.rb.spin } : null;
+  b.spin = vis ? vis.spin : 0;
+  b.owner = game.mySide; game.ownBall = true; game.X = game.knownX = ho.X; game.rb = null; R.simKey = '';
+  if (rallyLive() && rt !== null && Number.isFinite(ho.ts)) { const ff = clamp((rt - ho.ts) / 1000, 0, 0.3); for (let t = 0; t < ff && game.ownBall; t += STEP) physStep(b, STEP, ballEvent); }
+  // myk overgang fra den viste ballen til vår egen
+  if (vis && game.ownBall) { const ex = vis.x - b.x, ey = vis.y - b.y; if (Math.hypot(ex, ey) < 1.5) game.ownErr = { x: ex, y: ey }; }
 }
 
 // ====================================================================
@@ -2277,7 +2347,7 @@ function segInit(id, key, onChange) {
     if (onChange) onChange();
   });
 }
-segInit('segGames', 'games'); segInit('segDiff', 'diff'); segInit('segGfx', 'gfx', applyQuality);
+segInit('segGames', 'games'); segInit('segDiff', 'diff'); segInit('segGfx', 'gfx', () => { PERF.dyn = 1; applyQuality(); });
 nameIn.addEventListener('input', () => { store.set('name', nameIn.value); if (!game) sendLobby(); });
 function saveSettings() { store.set('name', nameIn.value); }
 
