@@ -19,9 +19,9 @@ Et realistisk 3D-tennisspill i nettleseren, sett fra siden som på TV. Spill mot
 | A / D eller ← / → | Løp frem og tilbake |
 | W eller ↑ | Hopp |
 | **X** | Slå (og serve: X kaster opp ballen, X igjen slår) |
-| **C** | Smash når ballen er over hodet |
+| **C** | Smash: kraftig slag ovenfra når ballen er over hodet (hopp med W for å nå høyere). Lynrask, bratt og spretter høyt |
 | Hold mot nettet når du slår | Hard topspin, langt |
-| Hold bakover når du slår | Slice, kort og lav |
+| Hold bakover når du slår | Lobb, høy og dyp. Gir motspilleren sjansen til smash |
 | Esc | Pause / meny |
 
 To på samme tastatur: venstre spiller bruker A/D/W, X og C, mens høyre spiller bruker piltastene, L (slå) og K (smash).
@@ -30,7 +30,7 @@ To på samme tastatur: venstre spiller bruker A/D/W, X og C, mens høyre spiller
 
 - Vanlig tennistelling (15–30–40, deuce, fordel). Den som først vinner det valgte antallet games, vinner kampen.
 - Serven må lande i serveruten. To feil gir dobbeltfeil.
-- Ballen har luftmotstand og spinn (Magnus-effekt). Topspin dykker og spretter høyt, slice svever og skrenser lavt.
+- Ballen har luftmotstand og spinn (Magnus-effekt). Topspin dykker og spretter høyt. En smash går over 40 m/s, treffer bratt og spretter høyt opp.
 - Banen har ekte mål: 23,77 m lang, med nett på 0,914 m.
 
 ## Legg spillet ut på GitHub Pages
