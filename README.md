@@ -43,5 +43,5 @@ To på samme tastatur: venstre spiller bruker A/D/W, X og C, mens høyre spiller
 ## Teknisk
 
 - Én fil (`index.html`). 3D-grafikken bruker [three.js](https://threejs.org) fra jsDelivr.
-- Online-spill går direkte mellom de to nettleserne (WebRTC via [PeerJS](https://peerjs.com)). Koden brukes bare for å finne hverandre.
-- På noen strenge nettverk (for eksempel enkelte skole- eller jobbnett) kan direktekoblingen bli blokkert. Prøv da fra et hjemmenett eller via mobildeling.
+- Online-spill går via en relétjeneste over sikre websockets (MQTT), så det virker gjennom de fleste brannmurer og nett. Spillet kobler til to offentlige servere samtidig for å være robust.
+- Hvis koblingen svikter: last siden på nytt hos begge, og lag en ny kode.

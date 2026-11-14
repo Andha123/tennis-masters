@@ -1511,13 +1511,16 @@ function buildBall(scene) {
     g.strokeStyle = '#f7f7ef'; g.lineWidth = 7;
     g.beginPath(); for (let x = 0; x <= w; x += 2) { const y = h / 2 + Math.sin(x / w * Math.PI * 4) * h * 0.28; x ? g.lineTo(x, y) : g.moveTo(x, y); } g.stroke();
   });
-  const ball = new THREE.Mesh(new THREE.SphereGeometry(BR, 24, 16), stdMat('#ffffff', 0.85, 0, { map: tex }));
-  ball.castShadow = true; scene.add(ball);
+  const ball = new THREE.Mesh(new THREE.SphereGeometry(BR, 24, 16), stdMat('#ffffff', 0.7, 0, { map: tex, emissive: '#b8f000', emissiveIntensity: 0.45 }));
+  ball.castShadow = true; ball.scale.setScalar(1.75); scene.add(ball);
+  const glowTex = canvasTex(64, 64, (g, w, h) => { const gr = g.createRadialGradient(32, 32, 0, 32, 32, 32); gr.addColorStop(0, 'rgba(235,255,120,0.9)'); gr.addColorStop(0.35, 'rgba(220,255,80,0.35)'); gr.addColorStop(1, 'rgba(220,255,80,0)'); g.fillStyle = gr; g.fillRect(0, 0, w, h); });
+  const glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }));
+  glow.scale.setScalar(0.42 / 1.75); ball.add(glow);
   const sh = canvasTex(64, 64, (g, w, h) => { const gr = g.createRadialGradient(32, 32, 2, 32, 32, 30); gr.addColorStop(0, 'rgba(0,0,0,.45)'); gr.addColorStop(1, 'rgba(0,0,0,0)'); g.fillStyle = gr; g.fillRect(0, 0, w, h); });
-  const blob = new THREE.Mesh(new THREE.PlaneGeometry(0.22, 0.22), new THREE.MeshBasicMaterial({ map: sh, transparent: true, depthWrite: false }));
+  const blob = new THREE.Mesh(new THREE.PlaneGeometry(0.32, 0.32), new THREE.MeshBasicMaterial({ map: sh, transparent: true, depthWrite: false }));
   blob.rotation.x = -Math.PI / 2; scene.add(blob);
   for (let i = 0; i < 6; i++) {
-    const m = new THREE.Mesh(new THREE.SphereGeometry(BR * 0.9, 10, 8), new THREE.MeshBasicMaterial({ color: '#e8ff60', transparent: true, opacity: 0.0, depthWrite: false }));
+    const m = new THREE.Mesh(new THREE.SphereGeometry(BR * 1.5, 10, 8), new THREE.MeshBasicMaterial({ color: '#efff70', transparent: true, opacity: 0.0, depthWrite: false }));
     scene.add(m); G3.trail.push(m);
   }
   G3.ball = ball; G3.ballShadow = blob;
@@ -1620,7 +1623,7 @@ function render3D(dt, t) {
     const tr = game.ball.trail;
     for (let i = 0; i < G3.trail.length; i++) {
       const m = G3.trail[i], pnt = tr[tr.length - 2 - i];
-      if (pnt && vb && !vb.held && Math.abs(vb.vx || 0) > 12) { m.visible = true; m.position.set(pnt.x, pnt.y, BALLZ); m.material.opacity = 0.28 * (1 - i / G3.trail.length); }
+      if (pnt && vb && !vb.held && Math.abs(vb.vx || 0) > 5) { m.visible = true; m.position.set(pnt.x, pnt.y, BALLZ); m.material.opacity = 0.42 * (1 - i / G3.trail.length); m.scale.setScalar(1 - i * 0.1); }
       else m.visible = false;
     }
     // TV-kamera: rammer inn begge spillerne (og ballen), zoomer inn når det er plass
@@ -1888,9 +1891,13 @@ function myName() { return (nameIn.value.trim() || 'Spiller').slice(0, 14); }
 function loadScript(src) {
   return new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = rej; document.head.append(s); });
 }
-function makeP2PRoom() {
+// ---- Online via relé (MQTT over WebSocket, port 443-lignende wss) ----
+// Fungerer gjennom brannmurer og ulike nett, i motsetning til direkte WebRTC.
+// Kobler til to offentlige servere samtidig og sender til begge; duplikater filtreres bort.
+const BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
+function makeRelayRoom() {
   const myPeer = 'p' + Math.random().toString(36).slice(2, 10);
-  let mine = {}, other = null, conn = null, peer = null, lastSend = 0, pending = false;
+  let mine = {}, other = null, clients = [], topic = null, lastSend = 0, pending = false, seq = 0, otherSeq = -1, lockPeer = null, waiter = null, wasConn = false;
   const peerCbs = [], connCbs = [];
   let snapshot = Object.freeze([]);
   function rebuild() {
@@ -1899,22 +1906,45 @@ function makeP2PRoom() {
     snapshot = Object.freeze(arr);
     for (const cb of peerCbs) cb({ peers: snapshot, joined: [], left: [], updated: [] });
   }
-  function sendNow() { lastSend = now(); if (conn && conn.open) { try { conn.send(JSON.stringify({ peer: myPeer, presence: mine })); } catch (e) {} } }
-  function setConn(c) { connCbs.forEach(cb => cb(c)); }
-  function attach(c) {
-    if (conn && conn.open) { try { c.close(); } catch (e) {} return; }
-    conn = c;
-    c.on('open', () => { sendNow(); setConn(true); });
-    c.on('data', d => {
-      let m; try { m = JSON.parse(d); } catch (e) { return; }
-      if (!m || typeof m.peer !== 'string' || typeof m.presence !== 'object') return;
-      other = { peer: m.peer.slice(0, 20), presence: Object.freeze(m.presence), updatedAt: now() };
-      rebuild();
-    });
-    const gone = () => { if (conn === c) { conn = null; other = null; rebuild(); setConn(false); } };
-    c.on('close', gone); c.on('error', gone);
+  const serverUp = () => clients.some(c => c.connected);
+  function connChanged() { const c = !!other && serverUp(); if (c !== wasConn) { wasConn = c; connCbs.forEach(cb => cb(c)); } }
+  function sendNow() {
+    lastSend = now();
+    if (!topic) return;
+    seq++;
+    const msg = JSON.stringify({ peer: myPeer, seq, presence: mine });
+    for (const c of clients) if (c.connected) { try { c.publish(topic, msg, { qos: 0 }); } catch (e) {} }
   }
-  setInterval(() => { if (now() - lastSend > 400) sendNow(); }, 250);
+  function onMsg(t, payload) {
+    let m; try { m = JSON.parse(typeof payload === 'string' ? payload : new TextDecoder().decode(payload)); } catch (e) { return; }
+    if (!m || typeof m.peer !== 'string' || m.peer === myPeer || !m.presence || typeof m.presence !== 'object' || !Number.isFinite(m.seq)) return;
+    const pid = m.peer.slice(0, 20);
+    if (lockPeer && pid !== lockPeer) return;          // bare én motspiller per kamp
+    if (!lockPeer) { lockPeer = pid; otherSeq = -1; }
+    if (m.seq <= otherSeq) return;                     // samme melding via den andre serveren
+    otherSeq = m.seq;
+    other = { peer: pid, presence: Object.freeze(m.presence), updatedAt: now() };
+    rebuild(); connChanged();
+    if (waiter) { const w = waiter; waiter = null; w(); }
+  }
+  setInterval(() => {
+    if (topic && now() - lastSend > 300) sendNow();
+    if (other && now() - other.updatedAt > 4000) { other = null; lockPeer = null; otherSeq = -1; rebuild(); connChanged(); }
+  }, 150);
+  function connect(code) {
+    room.close();
+    topic = 'tennisduell/v3/' + code.toLowerCase();
+    clients = BROKERS.map(url => {
+      let c;
+      try { c = window.mqtt.connect(url, { clientId: myPeer + Math.random().toString(36).slice(2, 6), clean: true, connectTimeout: 8000, reconnectPeriod: 2000, keepalive: 20 }); }
+      catch (e) { return null; }
+      c.on('connect', () => { c.subscribe(topic, { qos: 0 }); sendNow(); connChanged(); });
+      c.on('message', onMsg);
+      c.on('close', connChanged);
+      c.on('error', () => {});
+      return c;
+    }).filter(Boolean);
+  }
   const room = {
     p2p: true,
     presence(patch) {
@@ -1927,26 +1957,27 @@ function makeP2PRoom() {
     },
     peers() { return snapshot; },
     onPeers(fn) { peerCbs.push(fn); setTimeout(() => fn({ peers: snapshot, joined: snapshot, left: [], updated: [] }), 0); return () => {}; },
-    onConnection(fn) { connCbs.push(fn); setTimeout(() => fn(!!(conn && conn.open)), 0); return () => {}; },
-    connected() { return !!(conn && conn.open); },
+    onConnection(fn) { connCbs.push(fn); setTimeout(() => fn(wasConn), 0); return () => {}; },
+    connected() { return !!other && serverUp(); },
     host(code) {
+      connect(code);
       return new Promise((res, rej) => {
-        room.close();
-        peer = new window.Peer('tennisduell-' + code.toLowerCase());
-        peer.on('open', () => res());
-        peer.on('connection', c => attach(c));
-        peer.on('error', e => rej(e));
+        const t0 = now();
+        const iv = setInterval(() => { if (serverUp()) { clearInterval(iv); res(); } else if (now() - t0 > 12000) { clearInterval(iv); rej(new Error('server')); } }, 100);
       });
     },
     join(code) {
+      connect(code);
       return new Promise((res, rej) => {
-        room.close();
-        peer = new window.Peer();
-        peer.on('open', () => { const c = peer.connect('tennisduell-' + code.toLowerCase(), { reliable: true }); attach(c); c.on('open', () => res()); });
-        peer.on('error', e => rej(e));
+        const to = setTimeout(() => { if (waiter) { waiter = null; rej(new Error(serverUp() ? 'nohost' : 'server')); } }, 15000);
+        waiter = () => { clearTimeout(to); res(); };
       });
     },
-    close() { if (conn) { try { conn.close(); } catch (e) {} } conn = null; other = null; if (peer) { try { peer.destroy(); } catch (e) {} } peer = null; rebuild(); },
+    close() {
+      for (const c of clients) { try { c.end(true); } catch (e) {} }
+      clients = []; topic = null; other = null; lockPeer = null; otherSeq = -1; waiter = null;
+      rebuild(); connChanged();
+    },
   };
   rebuild();
   return room;
@@ -1956,12 +1987,12 @@ function newCode() { const a = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let s = ''; f
 async function initP2P() {
   const el = document.getElementById('onUnavailable');
   el.textContent = 'Laster nettkobling …';
-  try { if (!window.Peer) await loadScript('https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js'); } catch (e) {}
-  if (!window.Peer || !window.RTCPeerConnection) {
-    el.textContent = 'Klarte ikke å laste nettkoblingen. Sjekk at du er på internett og prøv igjen. Mot datamaskin og samme tastatur virker likevel.';
+  try { if (!window.mqtt) await loadScript('https://cdn.jsdelivr.net/npm/mqtt@5.16.1/dist/mqtt.min.js'); } catch (e) {}
+  if (!window.mqtt || typeof window.mqtt.connect !== 'function') {
+    el.textContent = 'Klarte ikke å laste nettkoblingen. Sjekk at du er på internett og last siden på nytt. Mot datamaskin og samme tastatur virker likevel.';
     return;
   }
-  const room = makeP2PRoom();
+  const room = makeRelayRoom();
   NET.room = room;
   room.onConnection(c => { NET.connected = c; });
   room.onPeers(ch => { for (const p of ch.peers) if (p.sameTab) NET.me = p.peer; if (!game) renderLobby(); });
@@ -1970,7 +2001,6 @@ async function initP2P() {
   document.getElementById('codeRow').classList.remove('hidden');
   document.getElementById('hostNote').textContent = 'eller skriv inn koden fra kompisen din';
   document.getElementById('onDot').classList.add('on');
-  sendLobby();
 }
 
 async function initRoom() {
@@ -2059,7 +2089,7 @@ async function joinByCode() {
   document.getElementById('waitText').textContent = 'Finner kompisen din. Dette tar som regel et par sekunder.';
   hideAll(); show('wait');
   try { await NET.room.join(code); }
-  catch (e) { if (NET.st === 'joining') { cancelOnline(); backToMenu('Fant ingen kamp med koden ' + code + '. Sjekk koden og at kompisen din venter.'); } }
+  catch (e) { if (NET.st === 'joining') { cancelOnline(); backToMenu(e && e.message === 'server' ? 'Fikk ikke kontakt med nettserveren. Sjekk internett og prøv igjen.' : 'Fant ingen kamp med koden ' + code + '. Sjekk koden, og at kompisen din står på «Venter på motspiller» akkurat nå.'); } }
 }
 function joinHost(peer) {
   saveSettings(); setMenuMsg('');
