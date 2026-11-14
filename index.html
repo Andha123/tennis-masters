@@ -1896,8 +1896,13 @@ function loadScript(src) {
 // ---- Online via relé (MQTT over WebSocket, port 443-lignende wss) ----
 // Fungerer gjennom brannmurer og ulike nett, i motsetning til direkte WebRTC.
 // Kobler til to offentlige servere samtidig og sender til begge; duplikater filtreres bort.
-const BROKERS = ['wss://mqtt.eclipseprojects.io/mqtt', 'wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
-const VERSION = '3.2';
+const BROKERS = [
+  { url: 'wss://public.cloud.shiftr.io:443', user: 'public', pass: 'public' },   // port 443 – slipper gjennom de fleste nett
+  { url: 'wss://broker.emqx.io:8084/mqtt' },
+  { url: 'wss://test.mosquitto.org:8081/mqtt' },
+  { url: 'wss://broker.hivemq.com:8884/mqtt' },
+];
+const VERSION = '3.3';
 function makeRelayRoom() {
   const myPeer = 'p' + Math.random().toString(36).slice(2, 10);
   let mine = {}, other = null, clients = [], topic = null, lastSend = 0, pending = false, seq = 0, otherSeq = -1, lockPeer = null, waiter = null, wasConn = false;
@@ -1936,9 +1941,9 @@ function makeRelayRoom() {
   }, 150);
   function ensureClients() {
     if (clients.length) return;
-    clients = BROKERS.map(url => {
+    clients = BROKERS.map(b => {
       let c;
-      try { c = window.mqtt.connect(url, { clientId: myPeer + Math.random().toString(36).slice(2, 6), clean: true, connectTimeout: 8000, reconnectPeriod: 2000, keepalive: 20 }); }
+      try { c = window.mqtt.connect(b.url, Object.assign({ clientId: myPeer + Math.random().toString(36).slice(2, 6), clean: true, connectTimeout: 8000, reconnectPeriod: 2000, keepalive: 20 }, b.user ? { username: b.user, password: b.pass } : {})); }
       catch (e) { return null; }
       c.on('connect', () => { if (topic) c.subscribe(topic, { qos: 0 }); sendNow(); connChanged(); });
       c.on('message', onMsg);
