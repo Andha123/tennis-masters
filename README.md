@@ -11,6 +11,7 @@ Et realistisk 3D-tennisspill i nettleseren, sett fra siden som på TV. Spill mot
 - **Online** – én trykker «Lag kamp» og sender koden, den andre skriver inn koden og trykker «Bli med»
 - **Lag din spiller** – antrekk (shorts, skjørt, kjole), farger og mønster, hudfarge, kroppsbygning, frisyre, skjegg, hodeplagg, briller, svettebånd, racket og sko
 - **Grafikk** – Rask, Høy eller Ultra 4K (rendrer i 3840×2160)
+- **Lyd** – Alt (publikum, slag og dommer som roper ut stillingen), Uten dommer eller Av
 
 ## Kontroller
 
@@ -33,6 +34,12 @@ To på samme tastatur: venstre spiller bruker A/D/W, X og C, mens høyre spiller
 - Ballen har luftmotstand og spinn (Magnus-effekt). Topspin dykker og spretter høyt. En smash går over 40 m/s, treffer bratt og spretter høyt opp.
 - Banen har ekte mål: 23,77 m lang, med nett på 0,914 m.
 
+## Spillerne
+
+- Hode, ansikt og hår er formet og malt i programmet: øyne med øyelokk, nese, lepper, ører, bryn, hårstrå, skjegg og skjeggstubb.
+- Armer og bein er sammenhengende og bøyer seg mykt i albue og kne, med muskelformer (lår, legger, biceps). Fingrene griper rundt racketen.
+- Bevegelsene følger fjærer: serven har oppkast med racketen ned og bak før trofé-stillingen, og armene går rolig tilbake til klarstilling etter slaget.
+
 ## Legg spillet ut på GitHub Pages
 
 1. Lag et nytt **public** repository på github.com, for eksempel `tennis-masters`.
@@ -43,5 +50,5 @@ To på samme tastatur: venstre spiller bruker A/D/W, X og C, mens høyre spiller
 ## Teknisk
 
 - Én fil (`index.html`). 3D-grafikken bruker [three.js](https://threejs.org) fra jsDelivr.
-- Online-spill går via en relétjeneste over sikre websockets (MQTT), så det virker gjennom de fleste brannmurer og nett. Spillet kobler til to offentlige servere samtidig for å være robust.
+- Online-spill går via en relétjeneste over sikre websockets (MQTT), så det virker gjennom de fleste brannmurer og nett. Spillet kobler til flere offentlige servere samtidig for å være robust.
 - Hvis koblingen svikter: last siden på nytt hos begge, og lag en ny kode.

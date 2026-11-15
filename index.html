@@ -108,6 +108,8 @@
         <div class="row"><label class="lbl">Grafikk</label>
           <div class="seg" id="segGfx"><button data-v="0">Rask</button><button data-v="1">Høy</button><button data-v="2" class="on">Ultra 4K</button></div>
           <span class="note" id="resNote" style="margin:0"></span></div>
+        <div class="row"><label class="lbl">Lyd</label>
+          <div class="seg" id="segSound"><button data-v="0" class="on">Alt</button><button data-v="1">Uten dommer</button><button data-v="2">Av</button></div></div>
       </div>
       <div class="btns">
         <button class="prim" id="bCpu">Spill mot datamaskin</button>
@@ -275,6 +277,11 @@ function randomLook() {
   if (Math.random() < 0.5) o.e = 0; if (Math.random() < 0.4) o.f = 0; if (o.o > 0) o.f = 0; if (Math.random() < 0.4) o.pt = 0;
   return o;
 }
+function mixHex(a, b, t) {
+  const p = x => [parseInt(x.slice(1, 3), 16), parseInt(x.slice(3, 5), 16), parseInt(x.slice(5, 7), 16)];
+  const A = p(a), B = p(b);
+  return '#' + A.map((v, i) => Math.round(lerp(v, B[i], t)).toString(16).padStart(2, '0')).join('');
+}
 function shade(hex, amt) {
   const n = parseInt(hex.slice(1), 16);
   let r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
@@ -293,47 +300,152 @@ function saveLooks() { store.set('look3d0', JSON.stringify(looks[0])); store.set
 // ====================================================================
 //  Lyd
 // ====================================================================
-let AC = null, noiseBuf = null;
+// Realistisk lyd: alt syntetiseres i nettleseren, med stereo etter hvor på banen det skjer
+// og etterklang som i en stor arena. Publikum er stille under ballvekslinger og klapper etter poeng.
+let AC = null, noiseBuf = null, master = null, dryBus = null, revIn = null, crowdBus = null;
+function makeIR(sec, decay) {
+  const len = Math.floor(AC.sampleRate * sec), b = AC.createBuffer(2, len, AC.sampleRate);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = b.getChannelData(ch);
+    for (let i = 0; i < len; i++) { const t = i / len; d[i] = (Math.random() * 2 - 1) * Math.pow(1 - t, decay) * (t < 0.02 ? t / 0.02 : 1); }
+    for (const [tt, g] of [[0.031, 0.5], [0.047, 0.35], [0.073, 0.28], [0.11, 0.2]]) { const i = Math.floor(tt * AC.sampleRate) + ch * 37; if (i < len) d[i] += g; }
+  }
+  return b;
+}
 function audioInit() {
   if (AC) { if (AC.state === 'suspended') AC.resume().catch(() => {}); return; }
   try {
     AC = new (window.AudioContext || window.webkitAudioContext)();
-    noiseBuf = AC.createBuffer(1, AC.sampleRate * 2, AC.sampleRate);
-    const d = noiseBuf.getChannelData(0);
-    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    noiseBuf = AC.createBuffer(1, AC.sampleRate * 3, AC.sampleRate);
+    const nd = noiseBuf.getChannelData(0);
+    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+    master = AC.createGain(); master.gain.value = settings.sound === 2 ? 0 : 0.9;
+    const comp = AC.createDynamicsCompressor(); comp.threshold.value = -14; comp.ratio.value = 3;
+    master.connect(comp).connect(AC.destination);
+    dryBus = AC.createGain(); dryBus.connect(master);
+    const conv = AC.createConvolver(); conv.buffer = makeIR(2.2, 3.2);
+    const wet = AC.createGain(); wet.gain.value = 0.3; conv.connect(wet).connect(master);
+    revIn = conv;
+    startCrowd();
   } catch (e) { AC = null; }
 }
-function tone(freq, dur, type, vol, slide) {
-  if (!AC) return;
-  const t = AC.currentTime, o = AC.createOscillator(), g = AC.createGain();
-  o.type = type || 'sine'; o.frequency.setValueAtTime(freq, t);
-  if (slide) o.frequency.exponentialRampToValueAtTime(slide, t + dur);
-  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
-  o.connect(g).connect(AC.destination); o.start(t); o.stop(t + dur + 0.02);
+function setSoundVolume() { if (master) master.gain.setTargetAtTime(settings.sound === 2 ? 0 : 0.9, AC.currentTime, 0.05); }
+// utgang med panorering etter banposisjon og litt etterklang
+function outAt(x, rev) {
+  const p = AC.createStereoPanner(); p.pan.value = clamp((x || 0) / 15, -0.85, 0.85);
+  p.connect(dryBus);
+  const s = AC.createGain(); s.gain.value = rev == null ? 0.35 : rev; p.connect(s); s.connect(revIn);
+  return p;
 }
-function noise(dur, vol, freq, q, attack) {
-  if (!AC) return;
-  const t = AC.currentTime, s = AC.createBufferSource(), f = AC.createBiquadFilter(), g = AC.createGain();
-  s.buffer = noiseBuf; f.type = 'bandpass'; f.frequency.value = freq; f.Q.value = q || 1;
-  g.gain.setValueAtTime(attack ? 0.001 : vol, t);
-  if (attack) g.gain.linearRampToValueAtTime(vol, t + attack);
-  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
-  s.connect(f).connect(g).connect(AC.destination); s.start(t); s.stop(t + dur + 0.05);
+function nz(dest, t, dur, gain, type, freq, q, attack, offset) {
+  const s = AC.createBufferSource(), f = AC.createBiquadFilter(), g = AC.createGain();
+  s.buffer = noiseBuf; f.type = type; f.frequency.value = freq; f.Q.value = q || 0.7;
+  g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(gain, t + (attack || 0.001)); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  s.connect(f).connect(g).connect(dest); s.start(t, offset != null ? offset : Math.random() * 2); s.stop(t + dur + 0.05);
+  return f;
+}
+function osc(dest, t, dur, gain, f0, f1, type) {
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type || 'sine'; o.frequency.setValueAtTime(f0, t); if (f1) o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(gain, t + 0.002); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g).connect(dest); o.start(t); o.stop(t + dur + 0.05);
+  return o;
+}
+const rnd = (a, b) => a + Math.random() * (b - a);
+// racket mot ball: stram streng-«pokk» + kropp i rammen + skarpt klikk
+function racketHit(x, power, rev) {
+  if (!AC || settings.sound === 2) return;
+  const t = AC.currentTime, o = outAt(x, rev);
+  nz(o, t, 0.05 + power * 0.03, 0.55 + power * 0.35, 'bandpass', rnd(1500, 1900) - power * 300, 7);
+  osc(o, t, 0.07 + power * 0.04, 0.5 + power * 0.4, rnd(200, 230) - power * 60, 95 - power * 25);
+  nz(o, t, 0.012, 0.35 + power * 0.3, 'highpass', 4500, 0.7);
+  if (power > 0.8) nz(o, t + 0.004, 0.1, 0.35, 'bandpass', 2600, 1.2);
+}
+// lyden av publikum: mumling mellom poengene, stille under ballvekslingen
+let crowdNoiseGain = null, crowdLevel = 0.03;
+function startCrowd() {
+  const s = AC.createBufferSource(); s.buffer = noiseBuf; s.loop = true;
+  const f1 = AC.createBiquadFilter(); f1.type = 'bandpass'; f1.frequency.value = 520; f1.Q.value = 0.6;
+  const f2 = AC.createBiquadFilter(); f2.type = 'lowshelf'; f2.frequency.value = 200; f2.gain.value = 6;
+  crowdNoiseGain = AC.createGain(); crowdNoiseGain.gain.value = 0;
+  const lfo = AC.createOscillator(), lg = AC.createGain(); lfo.frequency.value = 0.31; lg.gain.value = 0.006; lfo.connect(lg).connect(crowdNoiseGain.gain); lfo.start();
+  s.connect(f1).connect(f2).connect(crowdNoiseGain); crowdNoiseGain.connect(dryBus);
+  const rs = AC.createGain(); rs.gain.value = 0.6; crowdNoiseGain.connect(rs); rs.connect(revIn);
+  s.start();
+}
+function setCrowdLevel(v) { if (!AC || !crowdNoiseGain || Math.abs(v - crowdLevel) < 0.001) return; crowdLevel = v; crowdNoiseGain.gain.setTargetAtTime(v, AC.currentTime, 0.6); }
+function applause(intensity, dur) {
+  if (!AC || settings.sound === 2) return;
+  const t0 = AC.currentTime, n = Math.floor(260 * intensity * dur);
+  const bus = AC.createGain(); bus.gain.value = 0.9; bus.connect(dryBus); const rs = AC.createGain(); rs.gain.value = 0.7; bus.connect(rs); rs.connect(revIn);
+  for (let i = 0; i < n; i++) {
+    const u = Math.pow(Math.random(), 1.6), tt = t0 + 0.05 + u * dur;
+    const p = AC.createStereoPanner(); p.pan.value = rnd(-0.9, 0.9); p.connect(bus);
+    nz(p, tt, rnd(0.02, 0.045), rnd(0.02, 0.06) * intensity * (1 - u * 0.6), 'bandpass', rnd(900, 2600), rnd(0.8, 2.2), 0.0015);
+  }
+  if (intensity > 1) nz(bus, t0 + 0.05, dur * 0.9, 0.08 * intensity, 'bandpass', 800, 0.5, 0.25); // jubel
 }
 const SFX = {
-  hit()   { tone(440, 0.07, 'triangle', 0.3, 160); noise(0.05, 0.5, 2000, 1.5); },
-  smash() { tone(140, 0.22, 'sine', 0.55, 45); noise(0.09, 0.9, 2600, 0.9); tone(520, 0.08, 'square', 0.12, 180); setTimeout(() => noise(0.9, 0.18, 650, 0.6, 0.12), 90); },
-  serve() { tone(300, 0.1, 'triangle', 0.35, 110); noise(0.07, 0.6, 1800, 1); },
-  drive() { tone(380, 0.09, 'triangle', 0.35, 130); noise(0.06, 0.55, 2200, 1.2); },
-  bounce(){ tone(150, 0.07, 'sine', 0.35, 80); noise(0.03, 0.15, 900, 1); },
-  net()   { noise(0.2, 0.35, 450, 0.8); },
-  toss()  { noise(0.05, 0.08, 3000, 2); },
-  swish() { noise(0.14, 0.1, 3800, 2.5, 0.05); },
-  point() { noise(1.8, 0.2, 1000, 0.4, 0.3); },
-  fault() { tone(1200, 0.18, 'square', 0.06); },
-  click() { tone(880, 0.04, 'triangle', 0.1, 1200); },
-  win()   { noise(3, 0.3, 1000, 0.4, 0.4); },
+  hit(x)    { racketHit(x, 0.2); },
+  drive(x)  { racketHit(x, 0.55); },
+  serve(x)  { racketHit(x, 0.6); },
+  smash(x)  { racketHit(x, 1.0, 0.5); if (AC && settings.sound !== 2) setTimeout(() => { if (AC) nz(dryBus, AC.currentTime, 1.1, 0.07, 'bandpass', 620, 0.6, 0.18); }, 120); }, // «oooh» fra publikum
+  bounce(x, v) {
+    if (!AC || settings.sound === 2) return;
+    const t = AC.currentTime, o = outAt(x, 0.25), k = clamp((v || 12) / 18, 0.25, 1.2);
+    osc(o, t, 0.06, 0.38 * k, rnd(165, 190), 90);
+    nz(o, t, 0.035, 0.22 * k, 'lowpass', 1100, 0.7);
+  },
+  net(x) {
+    if (!AC || settings.sound === 2) return;
+    const t = AC.currentTime, o = outAt(x || 0, 0.3);
+    nz(o, t, 0.28, 0.4, 'bandpass', 420, 0.8, 0.01); osc(o, t, 0.12, 0.25, 110, 70);
+  },
+  toss(x)  { if (!AC || settings.sound === 2) return; const o = outAt(x, 0.2); nz(o, AC.currentTime, 0.03, 0.06, 'bandpass', 2400, 1.5); },
+  swish(x) {
+    if (!AC || settings.sound === 2) return;
+    const t = AC.currentTime, f = nz(outAt(x, 0.15), t, 0.16, 0.08, 'bandpass', 700, 2.5, 0.05);
+    f.frequency.setValueAtTime(700, t); f.frequency.exponentialRampToValueAtTime(2600, t + 0.12);
+  },
+  squeak(x) {
+    if (!AC || settings.sound === 2) return;
+    const t = AC.currentTime, o = outAt(x, 0.3), g = AC.createGain(); g.gain.value = 1; g.connect(o);
+    const bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 3000; bp.Q.value = 3; bp.connect(g);
+    const ob = osc(bp, t, rnd(0.08, 0.14), 0.05, rnd(2500, 2800), rnd(3100, 3500), 'sawtooth');
+    const lfo = AC.createOscillator(), lg = AC.createGain(); lfo.frequency.value = rnd(28, 40); lg.gain.value = 140; lfo.connect(lg).connect(ob.frequency); lfo.start(t); lfo.stop(t + 0.2);
+  },
+  step(x)  { if (!AC || settings.sound === 2) return; nz(outAt(x, 0.1), AC.currentTime, 0.025, 0.05, 'lowpass', 450, 0.7); },
+  point()  { applause(1, 2.4); },
+  fault()  {},
+  click()  { if (!AC) return; osc(dryBus, AC.currentTime, 0.04, 0.08, 900, 1300, 'triangle'); },
+  win()    { applause(2.4, 4.5); },
 };
+// Dommerens stemme (nettleserens talesyntese, britisk engelsk som i ekte tennis)
+let umpireVoice = null;
+function pickVoice() {
+  if (!window.speechSynthesis) return null;
+  const vs = speechSynthesis.getVoices();
+  return vs.find(v => /en-GB/i.test(v.lang) && /Daniel|Arthur|Oliver|Male/i.test(v.name)) || vs.find(v => /en-GB/i.test(v.lang)) || vs.find(v => /^en/i.test(v.lang)) || null;
+}
+if (window.speechSynthesis) { try { speechSynthesis.onvoiceschanged = () => { umpireVoice = pickVoice(); }; umpireVoice = pickVoice(); } catch (e) {} }
+function say(text, delay, loud) {
+  if (settings.sound !== 0 || !window.speechSynthesis || !text) return;
+  setTimeout(() => {
+    try {
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-GB'; if (umpireVoice) u.voice = umpireVoice;
+      u.rate = loud ? 1.05 : 0.95; u.pitch = loud ? 1.0 : 0.85; u.volume = loud ? 1 : 0.85;
+      speechSynthesis.speak(u);
+    } catch (e) {}
+  }, delay || 0);
+}
+const CALL = ['love', 'fifteen', 'thirty', 'forty'];
+function scoreCall(gs, names) {
+  const s = gs.server, a = gs.pts[s], b = gs.pts[1 - s];
+  if (a >= 3 && b >= 3) return a === b ? 'Deuce' : 'Advantage, ' + names[a > b ? s : 1 - s];
+  if (a === b) return a === 0 ? '' : CALL[a].charAt(0).toUpperCase() + CALL[a].slice(1) + ' all';
+  return CALL[Math.min(a, 3)].charAt(0).toUpperCase() + CALL[Math.min(a, 3)].slice(1) + ', ' + CALL[Math.min(b, 3)];
+}
 
 // ====================================================================
 //  Input
@@ -532,8 +644,8 @@ function physStep(b, dt, ev) {
 
 function ballEvent(type) {
   const b = game.ball;
-  if (type === 'bounce') { SFX.bounce(); G3.bounceMark(b.x); }
-  if (type === 'net') SFX.net();
+  if (type === 'bounce') { SFX.bounce(b.x, Math.abs(b.vy) / 0.74); G3.bounceMark(b.x); }
+  if (type === 'net') SFX.net(b.x);
   if (type === 'cross') {
     const ns = sideOfX(b.x);
     if (game.localSides[ns]) b.owner = ns;
@@ -634,12 +746,12 @@ function doHit(p, kind, q, mod) {
   p.hitDone = true; p.hitT = p.swT;
   NET.fx++; NET.fk = b.lastSmash ? 1 : 0;
   if (kind === 'smash') {
-    SFX.smash(); game.shake = 0.5; G3.cheer(0.8);
+    SFX.smash(b.x); game.shake = 0.5; G3.cheer(0.8);
     if (game.mode !== 'online') game.hitstop = 0.075;
     game.popup = { t: 0.9, x: b.x, y: b.y, txt: 'SMASH!' };
-  } else if (b.lastSmash) { SFX.serve(); game.shake = 0.18; }
-  else if (kind === 'drive') { SFX.drive(); game.shake = 0.08; }
-  else SFX.hit();
+  } else if (b.lastSmash) { SFX.serve(b.x); game.shake = 0.18; }
+  else if (kind === 'drive') { SFX.drive(b.x); game.shake = 0.08; }
+  else SFX.hit(b.x);
   game.hitFlash = { x: b.x, y: b.y, t: kind === 'smash' ? 0.3 : 0.16, big: kind === 'smash' };
   NET.fk = kind === 'smash' ? 1 : 0;
 }
@@ -664,11 +776,11 @@ function updatePlayer(p, inp, dt, speedMul) {
     if (serving && rallyLive() && game.ownBall) {
       b.held = false; b.hitter = -1; b._rolled = false;
       const h = handPos(p); b.x = h.x; b.y = h.y; b.vx = 0; b.vy = 5.8; b.sp = 0; b.kick = false;
-      SFX.toss();
+      SFX.toss(p.x);
     } else {
       p.swT = 0.0001; p.swK = inp.smash ? 'smash' : 'hit'; p.hitDone = false; p.hitT = -1;
       p.swOver = inp.smash || (b.hitter === -1 && b.owner === p.side && !b.held) || (!b.held && b.y > p.y + 1.85 && Math.abs(b.x - p.x) < 2);
-      SFX.swish();
+      SFX.swish(p.x);
     }
   }
 }
@@ -774,11 +886,18 @@ function update(dt) {
     game.lastMsgId = gs.msg.id;
     if (gs.msg.t) {
       game.msgShow = Object.assign({}, gs.msg, { t0: game.time });
-      if (gs.phase === 'over') { SFX.win(); G3.cheer(4); spawnConfetti(); setTimeout(showGameOver, 2200); }
-      else if (gs.msg.k === 'fault') SFX.fault();
-      else if (gs.msg.big) { SFX.point(); G3.cheer(gs.msg.k === 'smash' || gs.msg.k === 'ace' ? 2.2 : 1.4); }
+      const mm = gs.msg, nm = game.names;
+      if (mm.k === 'out') say('Out!', 0, true);
+      if (mm.k === 'fault') say(mm.t === 'Dobbeltfeil!' ? 'Double fault' : 'Fault', 0, true);
+      if (gs.phase === 'over') { SFX.win(); G3.cheer(4); spawnConfetti(); setTimeout(showGameOver, 2200); say('Game, set and match, ' + nm[gs.winner], 1300); }
+      else if (mm.k === 'fault' && mm.t !== 'Dobbeltfeil!') SFX.fault();
+      else if (mm.big) {
+        SFX.point(); G3.cheer(mm.k === 'smash' || mm.k === 'ace' ? 2.2 : 1.4);
+        say(String(mm.t).startsWith('Game ') ? 'Game, ' + nm[mm.w] : scoreCall(gs, nm), 1100);
+      } else if (gs.rally <= 1 || gs.pts[0] + gs.pts[1] === 0 && gs.games[0] + gs.games[1] === 0) say('Ready. Play.', 300);
     }
   }
+  setCrowdLevel(gs.phase === 'play' && !game.ball.held ? 0.004 : 0.026);
   if (game.shake > 0) game.shake -= dt;
   if (game.hitFlash) { game.hitFlash.t -= dt; if (game.hitFlash.t <= 0) game.hitFlash = null; }
   if (game.popup) { game.popup.t -= dt; if (game.popup.t <= 0) game.popup = null; }
@@ -857,11 +976,329 @@ function shirtTex(base, c2, pt) {
 function latheGeo(pts, segs) { return new THREE.LatheGeometry(pts.map(([r, y]) => new THREE.Vector2(r, y)), segs || 18); }
 // muskelprofiler (radius, høyde) for lår, legg, overarm og underarm
 const SH = {
-  thigh: [[0.001, 0.03], [0.08, 0.02], [0.088, -0.06], [0.083, -0.2], [0.07, -0.34], [0.056, -0.44], [0.001, -0.46]],
-  shin:  [[0.001, 0.02], [0.05, 0.01], [0.058, -0.07], [0.062, -0.13], [0.052, -0.25], [0.038, -0.37], [0.034, -0.43], [0.001, -0.45]],
-  upper: [[0.001, 0.04], [0.052, 0.02], [0.055, -0.07], [0.049, -0.18], [0.04, -0.29], [0.001, -0.31]],
-  fore:  [[0.001, 0.02], [0.04, 0.01], [0.045, -0.06], [0.036, -0.18], [0.027, -0.27], [0.001, -0.285]],
+  thigh: [[0.001, 0.03], [0.08, 0.02], [0.088, -0.06], [0.083, -0.2], [0.07, -0.34], [0.057, -0.43], [0.052, -0.47], [0.001, -0.495]],
+  shin:  [[0.001, 0.045], [0.046, 0.035], [0.051, 0.0], [0.058, -0.07], [0.062, -0.13], [0.052, -0.25], [0.038, -0.37], [0.034, -0.43], [0.001, -0.45]],
+  upper: [[0.001, 0.04], [0.052, 0.02], [0.055, -0.07], [0.049, -0.18], [0.04, -0.28], [0.037, -0.315], [0.001, -0.34]],
+  fore:  [[0.001, 0.035], [0.036, 0.028], [0.041, 0.0], [0.045, -0.06], [0.036, -0.18], [0.027, -0.27], [0.001, -0.285]],
 };
+
+// muskelrelieff rundt lemmets omkrets; lokal +x = forside (quadriceps, biceps, underarmens bøyere), s = kroppsside
+const LIMB_Y0 = {}, LIMB_LEN = {};
+for (const k in SH) { LIMB_Y0[k] = SH[k][0][1]; LIMB_LEN[k] = SH[k][0][1] - SH[k][SH[k].length - 1][1]; }
+function limbShape(key, k, s, fx, fz, y, out) {
+  const t = (LIMB_Y0[key] - y) / LIMB_LEN[key], inner = Math.max(-fz * s, 0), outer = Math.max(fz * s, 0);
+  const F = Math.max(fx, 0), B = Math.max(-fx, 0);
+  const ss = (a, b, x) => { const u = clamp((x - a) / (b - a), 0, 1); return u * u * (3 - 2 * u); };
+  let dr = 0, sx = 1, sz = 1;
+  if (key === 'thigh') {
+    dr += 0.011 * Math.pow(F, 1.4) * Gs(t - 0.42, 0.2) * k;          // quadriceps
+    dr += 0.008 * inner * F * Gs(t - 0.78, 0.07) * k;                  // vastus medialis («dråpen») over kneet
+    dr += 0.007 * B * Gs(t - 0.38, 0.2) * k;                           // baklår
+    dr -= 0.004 * Math.pow(outer, 3) * Gs(t - 0.5, 0.25);              // flatere utside
+  } else if (key === 'shin') {
+    dr += 0.017 * Math.pow(B, 1.2) * Gs(t - 0.3, 0.11) * (1 + 0.3 * inner) * k; // leggmuskel
+    dr += 0.004 * Math.pow(F, 2) * Gs(t - 0.13, 0.05);                 // tuberositas under kneet
+    dr -= 0.005 * Math.pow(F, 2) * Gs(t - 0.58, 0.2);                  // flat skinnlegg
+    dr -= 0.004 * B * Gs(t - 0.84, 0.07);                              // akillessene
+    dr += 0.005 * Math.pow(Math.abs(fz), 6) * Gs(t - 0.95, 0.03);      // ankelknoker
+    sz *= 1 - 0.12 * ss(0.65, 0.95, t);
+  } else if (key === 'upper') {
+    dr += 0.0095 * Math.pow(F, 1.5) * Gs(t - 0.5, 0.16) * k;           // biceps
+    dr += 0.0075 * B * Gs(t - 0.34, 0.2) * k;                          // triceps
+    dr += 0.003 * Math.pow(Math.abs(fz), 3) * Gs(t - 0.9, 0.05);       // albueknoker
+  } else if (key === 'fore') {
+    dr += 0.0075 * F * outer * Gs(t - 0.25, 0.12) * k;                 // brachioradialis
+    dr += 0.005 * F * Gs(t - 0.28, 0.16) * k;                          // bøyemuskler
+    dr += 0.0022 * B * outer * Gs(t - 0.93, 0.03);                     // håndleddsknoke
+    const w = ss(0.5, 0.98, t); sx *= 1 + 0.06 * w; sz *= 1 - 0.14 * w; // litt flatere håndledd
+  }
+  out.dr = dr; out.sx = sx; out.sz = sz; return out;
+}
+// ett sammenhengende, skinnet lem (lår+legg eller overarm+underarm) som bøyer seg mykt i kneet/albuen
+const limbGeoCache = {};
+function skinLimbGeo(kind, k, s) {
+  const ck = kind + k + s;
+  if (limbGeoCache[ck]) return limbGeoCache[ck];
+  const leg = kind === 'leg', A = leg ? 'thigh' : 'upper', Bk = leg ? 'shin' : 'fore', J = leg ? THIGH : UPPER, BL = leg ? 0.05 : 0.04;
+  const top = SH[A].slice(0, -1).filter(([, y]) => y > -J + 0.01);
+  const bot = SH[Bk].slice(1).map(([r, y]) => [r, y - J]).filter(([, y]) => y < -J - 0.05);
+  const joint = leg ? [[0.052, -J + 0.005], [0.053, -J - 0.03]] : [[0.039, -J + 0.008], [0.04, -J - 0.022]];
+  const pts = [...top, ...joint, ...bot].map(([r, y]) => new THREE.Vector2(Math.max(r * k, 0.001), y));
+  const prof = new THREE.SplineCurve(pts).getPoints(64);
+  prof[0].x = 0.001; prof[prof.length - 1].x = 0.001;
+  const geo = new THREE.LatheGeometry(prof, 30);
+  const p = geo.attributes.position, n = p.count;
+  const si = new Uint16Array(n * 4), sw = new Float32Array(n * 4), o1 = {}, o2 = {};
+  for (let i = 0; i < n; i++) {
+    const x = p.getX(i), y = p.getY(i), z = p.getZ(i), r = Math.hypot(x, z);
+    const w = clamp((-y - (J - BL)) / (2 * BL), 0, 1), wb = w * w * (3 - 2 * w);
+    si[i * 4] = 0; si[i * 4 + 1] = 1; sw[i * 4] = 1 - wb; sw[i * 4 + 1] = wb;
+    if (r < 0.002) continue;
+    const fx = x / r, fz = z / r;
+    limbShape(A, k, s, fx, fz, y, o1); limbShape(Bk, k, s, fx, fz, y + J, o2);
+    const ga = clamp((-y - (J - 0.03)) / 0.06, 0, 1);
+    const dr = lerp(o1.dr, o2.dr, ga), sx = lerp(o1.sx, o2.sx, ga), sz = lerp(o1.sz, o2.sz, ga), nr = r + dr;
+    p.setXYZ(i, fx * nr * sx, y, fz * nr * sz);
+  }
+  geo.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(si, 4));
+  geo.setAttribute('skinWeight', new THREE.Float32BufferAttribute(sw, 4));
+  geo.computeVertexNormals();
+  return (limbGeoCache[ck] = geo);
+}
+
+// ---------- Skulpturert hode: formet geometri + høyoppløselig malt hudtekstur (bryn, lepper, hår, skjegg) ----------
+const headGeoCache = {}, headTexCache = {}, irisTexCache = {};
+const Gs = (a, s) => Math.exp(-(a * a) / (2 * s * s));
+function hnoise(x, y, z) { // glatt støy til krøller og piggete hår
+  return Math.sin(x * 1.7 + Math.sin(y * 2.3)) * Math.cos(y * 1.9 + Math.sin(z * 1.3)) * Math.sin(z * 2.1 + x * 0.7);
+}
+// rask støy fra en forhåndsberegnet tabell (hodeteksturen males piksel for piksel)
+const NT = new Float32Array(65536);
+for (let i = 0; i < 65536; i++) { let h = Math.imul(i ^ 0x9e3779b9, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16; NT[i] = (h >>> 0) / 4294967296; }
+function hash1(n) { return NT[Math.floor(n) & 0xffff]; }
+function vnoise1(x) { const i = Math.floor(x), f = x - i, u = f * f * (3 - 2 * f), a = NT[i & 0xffff]; return a + (NT[(i + 1) & 0xffff] - a) * u; }
+function vnoise2(x, y) {
+  const i = Math.floor(x), j = Math.floor(y), fx = x - i, fy = y - j, ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const k = i * 57 + j * 113, a = NT[k & 0xffff], b = NT[(k + 57) & 0xffff], c = NT[(k + 113) & 0xffff], d = NT[(k + 170) & 0xffff];
+  const top = a + (b - a) * ux; return top + (c + (d - c) * ux - top) * uy;
+}
+function rgbOf(hex) { const v = parseInt(hex.slice(1), 16); return [(v >> 16 & 255) / 255, (v >> 8 & 255) / 255, (v & 255) / 255]; }
+// fra enhetsretning på kula til hodekoordinater (x frem, y opp, z til siden)
+function headCoords(nx, ny, nz, o) {
+  let px = nx * 0.098, py = ny * 0.118, pz = nz * 0.088;
+  if (py < 0) { const k = clamp(-py / 0.118, 0, 1); pz *= 1 - 0.24 * k * k; px *= 1 - 0.06 * k; }   // smalere kjeve
+  if (px < 0) { px *= 1.1; py *= 1.02; }                                                          // bakhodet
+  o.px = px; o.py = py; o.pz = pz; o.front = clamp(nx * 1.7, 0, 1); return o;
+}
+// ansiktets relieff (forskyvning fremover)
+function faceDx(py, pz, front) {
+  if (front <= 0) return 0;
+  const az = Math.abs(pz);
+  let dx = 0;
+  dx += 0.012 * Gs(py + 0.098, 0.016) * Gs(pz, 0.024);                                   // hake
+  dx += 0.006 * Gs(py - 0.044, 0.009) * Gs(az - 0.03, 0.024);                            // brynbue
+  dx += 0.003 * Gs(py - 0.04, 0.01) * Gs(pz, 0.012);                                     // glabella
+  dx -= 0.0135 * Gs(py - 0.019, 0.0092) * Gs(az - 0.033, 0.0165);                        // øyehuler
+  dx += 0.0085 * Gs(pz, 0.0066) * clamp((0.036 - py) / 0.05, 0, 1) * clamp((py + 0.034) / 0.006, 0, 1); // neserygg
+  dx += 0.0158 * Gs(py + 0.0225, 0.0102) * Gs(pz, 0.0092);                               // nesetipp
+  dx += 0.0078 * Gs(py + 0.029, 0.0058) * Gs(az - 0.0135, 0.0054);                       // nesevinger
+  dx -= 0.0045 * Gs(py + 0.0365, 0.0038) * Gs(pz, 0.012);                                // undersiden av nesa
+  dx += 0.0062 * Gs(py + 0.002, 0.016) * Gs(az - 0.052, 0.02);                           // kinnben
+  dx -= 0.0012 * Gs(pz, 0.0026) * Gs(py + 0.0435, 0.005);                                // filtrum
+  dx += 0.0062 * Gs(py + 0.052, 0.0055) * Gs(pz, 0.0175);                                // overleppe
+  dx += 0.0072 * Gs(py + 0.0655, 0.0058) * Gs(pz, 0.016);                                // underleppe
+  dx -= 0.0042 * Gs(py + 0.0588, 0.0019) * Gs(pz, 0.02);                                 // munnlinje
+  dx -= 0.0038 * Gs(py + 0.077, 0.0055) * Gs(pz, 0.02);                                  // fure under leppa
+  return dx * front;
+}
+// hudoverflatens x (fremover) i et punkt foran i ansiktet – brukes til å plassere øynene
+function faceSurfX(py, pz) {
+  const ny = py / 0.118, nz = pz / 0.088, nx = Math.sqrt(Math.max(0, 1 - ny * ny - nz * nz));
+  return nx * 0.098 + faceDx(py, pz, clamp(nx * 1.7, 0, 1));
+}
+function hairline(n) {
+  const th = Math.atan2(n.z, n.x), c = Math.cos(th);
+  return c > 0 ? lerp(0.012, 0.062, Math.pow(c, 1.5)) : lerp(0.012, -0.07, Math.pow(-c, 0.8));
+}
+const HAIR_VOL = [0.005, 0.008, 0.008, 0.006, 0.026, 0, 0.006, 0.006];
+function buildHeadGeo(L, seg) {
+  const key = [L.hs, L.f, seg].join(',');
+  if (headGeoCache[key]) return headGeoCache[key];
+  const g = new THREE.SphereGeometry(1, seg, Math.round(seg * 0.75));
+  const pos = g.attributes.position, n = new THREE.Vector3(), o = {};
+  const hasHair = L.hs !== 5, vol = HAIR_VOL[L.hs] || 0;
+  for (let i = 0; i < pos.count; i++) {
+    n.set(pos.getX(i), pos.getY(i), pos.getZ(i)).normalize();
+    headCoords(n.x, n.y, n.z, o);
+    let { px, py, pz } = o;
+    px += faceDx(py, pz, o.front);
+    if (L.f === 2) { // fullskjegg har volum
+      const yu = -0.046 + 0.06 * Math.pow(clamp((Math.abs(pz) - 0.024) / 0.058, 0, 1), 2.2);
+      const lower = clamp((yu - py) / 0.012, 0, 1) * clamp((n.x + 0.12) / 0.14, 0, 1) * (1 - clamp((Gs(py + 0.052, 0.006) + Gs(py + 0.066, 0.006)) * Gs(pz, 0.018) * 1.4, 0, 1));
+      const v = 0.007 * lower; px += n.x * v; py += n.y * v; pz += n.z * v;
+    }
+    if (hasHair) {
+      let hl = hairline(n); if (L.hs === 2 || L.hs === 3 || L.hs === 7) hl -= 0.004;
+      const edge = clamp((py - hl) / 0.008, 0, 1);
+      if (edge > 0) {
+        let v = vol * edge;
+        if (L.hs === 4) v += 0.01 * edge * hnoise(n.x * 14, n.y * 14, n.z * 14);
+        if (L.hs === 1) v += 0.016 * edge * Math.pow(Math.max(0, hnoise(n.x * 11, n.y * 11, n.z * 11)), 2) * clamp(n.y * 2, 0, 1);
+        px += n.x * v; py += n.y * v; pz += n.z * v;
+      }
+    }
+    pos.setXYZ(i, px, py, pz);
+  }
+  g.computeVertexNormals();
+  headGeoCache[key] = g;
+  return g;
+}
+// malt hud: farge- og ruhetskart i sfærens UV (ansiktet ligger midt i bildet)
+function buildHeadTex(L, W) {
+  const key = [L.k, L.h, L.hs, L.f, W].join(',');
+  if (headTexCache[key]) return headTexCache[key];
+  const H = W / 2;
+  const mk = () => { const c = document.createElement('canvas'); c.width = W; c.height = H; return c; };
+  const cv = mk(), rc = mk(), g = cv.getContext('2d'), gr = rc.getContext('2d');
+  const img = g.createImageData(W, H), rim = gr.createImageData(W, H), d = img.data, rd = rim.data;
+  const skin = rgbOf(PAL.skin[L.k]), hairC = rgbOf(PAL.hair[L.h]);
+  const lipC = rgbOf(mixHex(PAL.skin[L.k], '#a3423b', 0.42)), lipDark = rgbOf(mixHex(PAL.skin[L.k], '#5a1c1c', 0.6));
+  const blush = rgbOf(mixHex(PAL.skin[L.k], '#c8584e', 0.22)), deep = rgbOf(mixHex(PAL.skin[L.k], '#2a1210', 0.62));
+  const browC = hairC.map(v => v * 0.82), lashC = [0.07, 0.05, 0.045];
+  const hasHair = L.hs !== 5, o = {}, n = { x: 0, y: 0, z: 0 };
+  const col = [0, 0, 0];
+  const mix = (c, w) => { if (w <= 0) return; if (w > 1) w = 1; col[0] += (c[0] - col[0]) * w; col[1] += (c[1] - col[1]) * w; col[2] += (c[2] - col[2]) * w; };
+  const mul = k => { col[0] *= k; col[1] *= k; col[2] *= k; };
+  for (let r = 0; r < H; r++) {
+    const th = (r + 0.5) / H * Math.PI, ny = Math.cos(th), st = Math.sin(th);
+    for (let c = 0; c < W; c++) {
+      const ph = (c + 0.5) / W * Math.PI * 2;
+      n.x = -Math.cos(ph) * st; n.y = ny; n.z = Math.sin(ph) * st;
+      headCoords(n.x, n.y, n.z, o);
+      const py = o.py, pz = o.pz, az = Math.abs(pz), fr = o.front;
+      // hud med flekkvis variasjon og porer
+      const mott = (vnoise2(c * 22 / W, r * 22 / W) - 0.5) * 1.2 + (vnoise2(c * 0.05, r * 0.05) - 0.5) * 0.3;
+      const k = 1 + 0.03 * mott + (hash1(c * 7.13 + r * 91.7) - 0.5) * 0.03;
+      col[0] = skin[0] * k; col[1] = skin[1] * k; col[2] = skin[2] * k;
+      let rough = 0.52;
+      let lipW = 0;
+      if (fr > 0 && py < 0.072 && py > -0.118 && az < 0.085) {
+        // rødme på kinn, nesetipp og ører, skygge i øyehuler
+        mix(blush, (Gs(py + 0.01, 0.018) * Gs(az - 0.048, 0.018) * 0.9 + Gs(py + 0.022, 0.009) * Gs(pz, 0.01) * 0.7) * fr);
+        mix(deep, Gs(py - 0.017, 0.0085) * Gs(az - 0.034, 0.016) * 0.22 * fr);
+        // øyelokkfold og mørke under øyet
+        const ex = (az - 0.033) / 0.016;
+        mix(deep, Gs(py - (0.0285 - 0.005 * ex * ex), 0.0011) * clamp(1 - Math.abs(ex) * 0.8, 0, 1) * 0.4 * fr);
+        mix(deep, Gs(py - 0.0065, 0.0035) * Gs(az - 0.035, 0.009) * 0.12 * fr);
+        // nesebor og neseving-kant
+        mix(deep, Gs((py + 0.0318) / 0.0019, 1) * Gs((az - 0.0078) / 0.0031, 1) * 0.92 * fr);
+        mix(deep, Gs(py + 0.027, 0.004) * Gs(az - 0.0185, 0.0014) * 0.25 * fr);
+        // nasolabialfold
+        if (py < -0.026 && py > -0.07) { const azc = 0.02 + (-0.028 - py) * 0.32; mix(deep, Gs(az - azc, 0.0022) * 0.12 * clamp((-0.026 - py) / 0.006, 0, 1) * clamp((py + 0.07) / 0.01, 0, 1) * fr); }
+        // lepper med amorbue
+        const zz = pz / 0.0215;
+        if (Math.abs(zz) < 1.3) {
+          const edgeZ = clamp((1 - Math.abs(zz)) / 0.12, 0, 1);
+          const top = -0.0497 - 0.0045 * zz * zz + 0.0011 * Gs(zz - 0.24, 0.12) + 0.0011 * Gs(zz + 0.24, 0.12) - 0.0006 * Gs(zz, 0.07);
+          const line = -0.0588 - 0.0004 * zz * zz;
+          const bot = -0.0695 + 0.0085 * zz * zz;
+          const up = clamp((top - py) / 0.0007, 0, 1) * clamp((py - line) / 0.0005, 0, 1);
+          const lo = clamp((py - bot) / 0.0008, 0, 1) * clamp((line - py) / 0.0005, 0, 1);
+          lipW = Math.max(up, lo) * edgeZ * fr;
+          const stri = 0.94 + 0.08 * vnoise1(pz * 2600);
+          if (lipW > 0) { mix(lipC, lipW); if (up > lo) mix(lipDark, up * edgeZ * 0.18 * fr); mul(lerp(1, stri, lipW)); }
+          mix(lipDark, Gs(py - line, 0.00075) * clamp((1.08 - Math.abs(zz)) / 0.1, 0, 1) * 0.85 * fr);
+          rough = lerp(rough, 0.3, lipW);
+        }
+        rough -= 0.08 * Gs(pz, 0.012) * clamp((py + 0.03) / 0.02, 0, 1) * clamp((0.06 - py) / 0.02, 0, 1) * fr; // blank nese/panne
+        // bryn med hårstrå
+        if (az > 0.008 && az < 0.06 && py > 0.03 && py < 0.065) {
+          const t = (az - 0.012) / 0.04;
+          const yb = 0.0465 + 0.0062 * Math.sin(clamp(t, 0, 1) * Math.PI * 0.85) - 0.0022 * t;
+          const hw = 0.0036 * (1 - 0.5 * clamp(t, 0, 1)) + 0.0011;
+          const m = clamp((hw - Math.abs(py - yb)) / 0.0011, 0, 1) * clamp((t + 0.08) / 0.12, 0, 1) * clamp((1.05 - t) / 0.15, 0, 1);
+          if (m > 0) {
+            const s = vnoise2(az * 1500 + py * 400, (py - yb) * 5200 + az * 300 * (1 - t));
+            mix(browC, m * (0.45 + 0.55 * s) * fr); rough = lerp(rough, 0.7, m);
+          }
+        }
+        // ansiktshår
+        if (L.f) {
+          const must = Gs(py + 0.0445, 0.0048) * Gs(pz, 0.023) * (1 - lipW);
+          const yu = -0.046 + 0.06 * Math.pow(clamp((az - 0.024) / 0.058, 0, 1), 2.2) + (vnoise1(az * 900) - 0.5) * 0.0025;
+          const lower = clamp((yu - py) / 0.007, 0, 1) * (1 - lipW) * clamp(1 - Gs(pz, 0.006) * Gs(py + 0.075, 0.004) * 0.7, 0, 1);
+          let bw = L.f === 1 ? must : Math.max(must, lower);
+          bw *= clamp((n.x + 0.12) / 0.14, 0, 1);
+          if (bw > 0) {
+            if (L.f === 3) { // skjeggstubb: tette, mørke prikker
+              const dot = hash1(c * 3.7 + r * 17.3) > 0.42 ? 1 : 0.35;
+              mix(hairC, bw * 0.5 * dot); mul(1 - 0.08 * bw);
+            } else {
+              const s = vnoise2(c * 0.7 + r * 0.25, r * 0.9) * 0.6 + vnoise2(c * 0.25, r * 0.25) * 0.4;
+              mix(hairC, bw * 0.97); mul(0.78 + 0.42 * s * bw + (1 - bw) * 0.22); rough = lerp(rough, 0.72, bw);
+            }
+          }
+        }
+      }
+      // hår på hodet
+      if (hasHair) {
+        let hl = hairline(n); if (L.hs === 2 || L.hs === 3 || L.hs === 7) hl -= 0.004;
+        hl += (vnoise1(Math.atan2(n.z, n.x) * 60) - 0.5) * 0.004;
+        const edge = clamp((py - hl) / 0.0045, 0, 1);
+        if (edge > 0) {
+          let s;
+          if (L.hs === 4) s = vnoise2(c * 0.35, r * 0.35) * 0.5 + vnoise2(c * 0.9, r * 0.9) * 0.5;
+          else if (L.hs === 1) s = vnoise2(c * 0.6, r * 0.6);
+          else { const a = Math.atan2(n.z, n.x * 0.6 - 0.25); s = vnoise1(a * 140 + (vnoise2(c * 12 / W, r * 12 / W) - 0.5) * 9) * 0.65 + vnoise1(a * 420) * 0.35; }
+          mix(hairC, edge * (0.85 + 0.15 * edge));
+          mul(0.7 + 0.5 * s * edge + (1 - edge) * 0.3);
+          rough = lerp(rough, 0.62, edge);
+        } else {
+          const fuzz = clamp((py - hl + 0.006) / 0.006, 0, 1); // dun i hårfestet
+          if (fuzz > 0) mix(hairC, fuzz * 0.25 * (hash1(c * 5.1 + r * 3.3) > 0.5 ? 1 : 0.3));
+        }
+      }
+      const i = (r * W + c) * 4;
+      d[i] = col[0] * 255; d[i + 1] = col[1] * 255; d[i + 2] = col[2] * 255; d[i + 3] = 255;
+      const rv = clamp(rough, 0.05, 1) * 255; rd[i] = rv; rd[i + 1] = rv; rd[i + 2] = rv; rd[i + 3] = 255;
+    }
+  }
+  g.putImageData(img, 0, 0); gr.putImageData(rim, 0, 0);
+  const tex = new THREE.CanvasTexture(cv), rtex = new THREE.CanvasTexture(rc);
+  tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = 8;
+  headTexCache[key] = { map: tex, rough: rtex };
+  return headTexCache[key];
+}
+function irisTex(hex) {
+  if (irisTexCache[hex]) return irisTexCache[hex];
+  const c = rgbOf(hex);
+  const t = canvasTex(64, 64, (g, W, H) => {
+    const im = g.createImageData(W, H);
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const rr = y / H; // 0 = midten (pupill), 1 = ytterkant
+      let k;
+      if (rr < 0.36) k = 0.02;
+      else {
+        const f = vnoise1(x * 0.9) * 0.6 + vnoise1(x * 2.7 + y * 0.2) * 0.4;
+        k = (0.65 + 0.7 * f) * (rr < 0.5 ? 0.75 : 1) * (rr > 0.86 ? 0.45 : 1);
+      }
+      const i = (y * W + x) * 4;
+      im.data[i] = clamp(c[0] * k * 255, 0, 255); im.data[i + 1] = clamp(c[1] * k * 255, 0, 255); im.data[i + 2] = clamp(c[2] * k * 255, 0, 255); im.data[i + 3] = 255;
+    }
+    g.putImageData(im, 0, 0);
+  });
+  t.colorSpace = THREE.SRGBColorSpace;
+  return (irisTexCache[hex] = t);
+}
+// øye med eplet, iris, hornhinne og øyelokk som former mandelformen
+function buildEye(parent, s, skinC, irisHex, detail) {
+  const r = 0.0122, ey = 0.0185, ez = s * 0.0325;
+  const ex = faceSurfX(ey, Math.abs(ez)) - r + 0.0047;
+  const eye = new THREE.Group(); eye.position.set(ex, ey, ez); parent.add(eye);
+  const seg = detail ? 24 : 12;
+  const white = new THREE.Mesh(new THREE.SphereGeometry(r, seg, seg * 0.75), new THREE.MeshPhysicalMaterial({ color: '#ece6dc', roughness: 0.35, clearcoat: 1, clearcoatRoughness: 0.08 }));
+  eye.add(white);
+  const ia = Math.asin(0.0056 / r);
+  const iris = new THREE.Mesh(new THREE.SphereGeometry(r * 1.004, seg, 6, 0, Math.PI * 2, 0, ia), new THREE.MeshPhysicalMaterial({ map: irisTex(irisHex), roughness: 0.4, clearcoat: 1, clearcoatRoughness: 0.04 }));
+  iris.rotation.z = -Math.PI / 2; eye.add(iris);
+  // øyelokk: skall utenpå eplet; mørk vippekant langs åpningen
+  const lidMat = new THREE.MeshPhysicalMaterial({ color: skinC, vertexColors: true, roughness: 0.55, sheen: 0.4, sheenColor: new THREE.Color(shade(skinC, 0.25)) });
+  const mkLid = (t0, t1, edgeAt, dark) => {
+    const geo = new THREE.SphereGeometry(r * 1.075, seg, 10, 0, Math.PI * 2, t0, t1 - t0);
+    const p = geo.attributes.position, cols = new Float32Array(p.count * 3);
+    for (let i = 0; i < p.count; i++) {
+      const pa = Math.acos(clamp(p.getY(i) / (r * 1.075), -1, 1));
+      const w = Gs(pa - edgeAt, 0.09) * dark;
+      cols[i * 3] = lerp(1, 0.22, w); cols[i * 3 + 1] = lerp(1, 0.16, w); cols[i * 3 + 2] = lerp(1, 0.14, w);
+    }
+    geo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+    return new THREE.Mesh(geo, lidMat);
+  };
+  const up = mkLid(0, 1.12, 1.12, 1), lo = mkLid(2.12, Math.PI, 2.12, 0.4);
+  up.rotation.z = -0.15; lo.rotation.z = 0.1;
+  eye.add(up, lo);
+  return eye;
+}
 
 function buildHuman(look, h, opts) {
   opts = opts || {};
@@ -871,37 +1308,40 @@ function buildHuman(look, h, opts) {
   const shirtC = PAL.shirt[L.s], c2 = PAL.shirt[L.c2], skinC = PAL.skin[L.k];
   const bottomC = outfit === 2 ? shirtC : outfit === 3 ? '#1d2433' : PAL.shorts[L.p];
   const M = {
-    skin: stdMat(skinC, 0.55),
+    skin: new THREE.MeshPhysicalMaterial({ color: skinC, roughness: 0.52, sheen: 0.5, sheenRoughness: 0.55, sheenColor: new THREE.Color(shade(skinC, 0.25)), clearcoat: 0.06, clearcoatRoughness: 0.7 }),
     shirt: stdMat('#ffffff', 0.88, 0, { map: shirtTex(shirtC, c2, L.pt) }),
     trim: stdMat(L.pt ? c2 : shade(shirtC, -0.22), 0.85),
     bottom: stdMat(bottomC, 0.85, 0, { side: THREE.DoubleSide }),
     hair: stdMat(PAL.hair[L.h], 0.62), shoe: stdMat(PAL.shoe[L.sh], 0.5), sole: stdMat('#ececec', 0.7), shoeAcc: stdMat(c2, 0.5),
     sock: stdMat('#f3f3f3', 0.95), hat: stdMat(PAL.shirt[L.wc], 0.75), hatDark: stdMat(shade(PAL.shirt[L.wc], -0.25), 0.75), dark: stdMat('#121212', 0.2, 0.4),
-    eyeW: stdMat('#f1efe9', 0.25), iris: stdMat(['#3b2516', '#24507a', '#3f5a2a', '#1c120b'][(L.k + L.h) % 4], 0.25), pupil: stdMat('#050505', 0.2),
-    lips: stdMat(shade(skinC, -0.25), 0.5), band: stdMat(L.wb === 2 ? c2 : '#f6f6f4', 0.95),
+    earIn: stdMat(shade(skinC, -0.18), 0.6),
+    band: stdMat(L.wb === 2 ? c2 : '#f6f6f4', 0.95),
     frame: stdMat(PAL.racket[L.r], 0.3, 0.35), grip: stdMat('#efefec', 0.85),
     stub: stdMat(PAL.hair[L.h], 0.9, 0, { transparent: true, opacity: 0.4, depthWrite: false }),
   };
   const root = new THREE.Group();
   const mesh = (geo, mat, parent, x, y, z) => { const m = new THREE.Mesh(geo, mat); m.castShadow = true; m.receiveShadow = true; m.position.set(x || 0, y || 0, z || 0); parent.add(m); return m; };
-  const limb = (key, mat, parent, k) => mesh(latheGeo(SH[key].map(([r, y]) => [r * (k || bw), y])), mat, parent);
+  const skinned = [];
+  const skinLimb = (kind, mat, parent, b0, b1, s) => {
+    const m = new THREE.SkinnedMesh(skinLimbGeo(kind, bw, s), mat); m.position.copy(b0.position); m.castShadow = m.receiveShadow = true; m.frustumCulled = false;
+    m.userData.sharedGeo = true; parent.add(m); skinned.push([m, b0, b1]); return m;
+  };
   const sph = (r, ws, hs) => new THREE.SphereGeometry(r, ws || 20, hs || 14);
   const capGeo = (r, t) => new THREE.SphereGeometry(r, 28, 16, 0, Math.PI * 2, 0, Math.PI * t);
 
   // --- hofte og bein ---
   const hips = new THREE.Group(); hips.position.y = HIP_H; root.add(hips);
-  const pelvis = mesh(new THREE.CylinderGeometry(0.15 * bw, 0.165 * bw, 0.22, 24), M.bottom, hips, 0, -0.02, 0); pelvis.scale.z = 0.78;
-  mesh(new THREE.CylinderGeometry(0.153 * bw, 0.153 * bw, 0.035, 24), outfit === 3 ? M.dark : M.bottom, hips, 0, 0.09, 0).scale.z = 0.8;
-  if (outfit === 1 || outfit === 2) { const sk = mesh(new THREE.CylinderGeometry(0.162 * bw, 0.3 * bw, 0.34, 28, 1, true), M.bottom, hips, 0.01, -0.17, 0); sk.scale.z = 0.86; }
+  const pelvis = mesh(new THREE.CylinderGeometry(0.15 * bw, 0.165 * bw, 0.22, 28), M.bottom, hips, 0, -0.02, 0); pelvis.scale.z = 0.68;
+  mesh(new THREE.CylinderGeometry(0.153 * bw, 0.153 * bw, 0.035, 28), outfit === 3 ? M.dark : M.bottom, hips, 0, 0.09, 0).scale.z = 0.68;
+  if (outfit === 1 || outfit === 2) { const sk = mesh(new THREE.CylinderGeometry(0.152 * bw, 0.3 * bw, 0.34, 32, 1, true), M.bottom, hips, 0.01, -0.185, 0); sk.scale.z = 0.8; }
   const legs = [];
   for (const s of [-1, 1]) {
-    const thigh = new THREE.Group(); thigh.position.set(0, -0.07, s * 0.09 * bw); hips.add(thigh);
-    limb('thigh', M.skin, thigh);
-    if (outfit === 0) mesh(new THREE.CylinderGeometry(0.098 * bw, 0.092 * bw, 0.24, 18, 1, true), M.bottom, thigh, 0, -0.1, 0);
+    const thigh = new THREE.Bone(); thigh.position.set(0, -0.07, s * 0.09 * bw); hips.add(thigh);
+    if (outfit === 0) mesh(new THREE.CylinderGeometry(0.104 * bw, 0.108 * bw, 0.25, 22, 1, true), M.bottom, thigh, 0, -0.1, 0);
     if (outfit === 3) mesh(new THREE.CylinderGeometry(0.098 * bw, 0.075 * bw, 0.47, 16), M.bottom, thigh, 0, -0.22, 0);
-    const knee = new THREE.Group(); knee.position.y = -THIGH; thigh.add(knee);
-    mesh(sph(0.056 * bw, 14, 10), outfit === 3 ? M.bottom : M.skin, knee);
-    limb('shin', M.skin, knee);
+    const knee = new THREE.Bone(); knee.position.y = -THIGH; thigh.add(knee);
+    skinLimb('leg', M.skin, hips, thigh, knee, s);
+    if (outfit !== 3) { const pat = mesh(sph(0.025, 14, 10), M.skin, knee, 0.03 * bw, 0.006, 0); pat.scale.set(0.62, 1.05, 0.95); }
     if (outfit === 3) mesh(new THREE.CylinderGeometry(0.07, 0.062, SHIN, 14), M.bottom, knee, 0, -SHIN / 2, 0);
     else mesh(new THREE.CylinderGeometry(0.041, 0.04, 0.1, 14), M.sock, knee, 0, -SHIN + 0.06, 0);
     const ankle = new THREE.Group(); ankle.position.y = -SHIN; knee.add(ankle);
@@ -916,7 +1356,7 @@ function buildHuman(look, h, opts) {
 
   // --- overkropp ---
   const chest = new THREE.Group(); chest.position.y = 0.05; hips.add(chest);
-  const tp = [[0.001, -0.02], [0.142, 0], [0.138, 0.08], [0.15, 0.2], [0.176, 0.34], [0.186, 0.43], [0.166, 0.5], [0.1, 0.555], [0.001, 0.57]];
+  const tp = [[0.001, -0.05], [0.172, -0.046], [0.162, 0.02], [0.15, 0.2], [0.176, 0.34], [0.186, 0.43], [0.166, 0.5], [0.1, 0.555], [0.001, 0.57]];
   const torso = mesh(latheGeo(tp.map(([r, y]) => [r * bw, y]), 36), M.shirt, chest); torso.scale.z = 0.64;
   for (const s of [-1, 1]) { const tr = mesh(sph(0.07, 14, 10), M.shirt, chest, -0.015, 0.5, s * 0.095 * bw); tr.scale.set(0.8, 0.5, 1.1); }
   // polokrage og knappestolpe
@@ -926,40 +1366,29 @@ function buildHuman(look, h, opts) {
   // nakke og hode
   mesh(new THREE.CylinderGeometry(0.05 * bw, 0.058 * bw, 0.14, 16), M.skin, chest, 0.006, 0.61, 0);
   const head = new THREE.Group(); head.position.y = 0.735; chest.add(head);
-  const skull = mesh(sph(0.102, 32, 24), M.skin, head); skull.scale.set(1.0, 1.13, 0.9);
-  const jaw = mesh(sph(0.078, 24, 16), M.skin, head, 0.026, -0.058, 0); jaw.scale.set(1, 0.82, 0.93);
-  const chin = mesh(sph(0.03, 14, 10), M.skin, head, 0.084, -0.094, 0); chin.scale.set(1, 0.8, 1.25);
-  for (const s of [-1, 1]) { const ck = mesh(sph(0.032, 14, 10), M.skin, head, 0.068, -0.02, s * 0.05); ck.scale.set(0.8, 0.9, 1); }
-  const bridge = mesh(new THREE.CapsuleGeometry(0.011, 0.035, 4, 8), M.skin, head, 0.098, 0.004, 0); bridge.rotation.z = 0.25;
-  const tip = mesh(sph(0.017, 12, 10), M.skin, head, 0.108, -0.02, 0); tip.scale.set(1.1, 0.9, 1.15);
+  // skulpturert hode med malte ansiktstrekk (se buildHeadGeo)
+  const hiDet = !opts.noRacket, HT = buildHeadTex(L, hiDet ? 768 : 384);
+  const headMat = new THREE.MeshPhysicalMaterial({ map: HT.map, roughnessMap: HT.rough, roughness: 1, sheen: 0.4, sheenRoughness: 0.6, sheenColor: new THREE.Color(shade(skinC, 0.25)), clearcoat: 0.04, clearcoatRoughness: 0.7 });
+  const skull = mesh(buildHeadGeo(L, hiDet ? 160 : 72), headMat, head); skull.userData.sharedGeo = true;
   for (const s of [-1, 1]) {
-    const ear = mesh(sph(0.026, 12, 10), M.skin, head, -0.004, -0.004, s * 0.093); ear.scale.set(0.62, 1, 0.33);
-    mesh(sph(0.0135, 14, 10), M.eyeW, head, 0.083, 0.022, s * 0.034);
-    mesh(sph(0.0072, 10, 8), M.iris, head, 0.0945, 0.022, s * 0.034);
-    mesh(sph(0.0036, 8, 6), M.pupil, head, 0.0985, 0.022, s * 0.034);
-    const lid = mesh(new THREE.SphereGeometry(0.0148, 14, 8, 0, Math.PI * 2, 0, Math.PI * 0.45), M.skin, head, 0.083, 0.022, s * 0.034); lid.rotation.z = -0.55;
-    const brow = mesh(new THREE.BoxGeometry(0.014, 0.008, 0.036), M.hair, head, 0.094, 0.047, s * 0.035); brow.rotation.x = s * 0.12;
+    const ear = new THREE.Group(); ear.position.set(-0.008, -0.004, s * 0.086); ear.rotation.set(s * -0.1, s * 0.4, 0.18); head.add(ear);
+    mesh(sph(0.026, 16, 12), M.skin, ear).scale.set(0.56, 1.1, 0.26);
+    const helix = mesh(new THREE.TorusGeometry(0.0205, 0.0042, 8, 22, Math.PI * 1.45).rotateZ(-Math.PI * 0.2), M.skin, ear, -0.001, 0.003, s * 0.0052); helix.scale.set(0.6, 1.15, 1);
+    mesh(sph(0.0125, 12, 10), M.earIn, ear, 0.004, -0.004, s * 0.0052).scale.set(0.75, 1.1, 0.35);
+    mesh(sph(0.0085, 10, 8), M.skin, ear, 0.002, -0.021, s * 0.002).scale.set(0.95, 1.05, 0.6);
+    buildEye(head, s, skinC, ['#5a3a22', '#3a6a98', '#5a7a3a', '#2e1e12'][(L.k + L.h) % 4], hiDet);
   }
-  const upLip = mesh(new THREE.CapsuleGeometry(0.0065, 0.032, 4, 8), M.lips, head, 0.094, -0.054, 0); upLip.rotation.x = Math.PI / 2;
-  const loLip = mesh(new THREE.CapsuleGeometry(0.0075, 0.028, 4, 8), M.lips, head, 0.091, -0.066, 0); loLip.rotation.x = Math.PI / 2;
-  // ansiktshår
-  if (L.f === 2 || L.f === 3) { const beard = mesh(new THREE.SphereGeometry(0.086, 24, 16, 0, Math.PI * 2, Math.PI * 0.42, Math.PI * 0.58), L.f === 2 ? M.hair : M.stub, head, 0.026, -0.05, 0); beard.scale.set(1.05, 0.96, 1.0); }
-  if (L.f === 1 || L.f === 2) { const mu = mesh(new THREE.CapsuleGeometry(0.009, 0.04, 4, 8), M.hair, head, 0.1, -0.043, 0); mu.rotation.x = Math.PI / 2; }
-  // hår
+  // frisyrer med hår utenfor hodeformen
   const hs = L.hs;
-  if (hs === 5) { const sh = mesh(capGeo(0.106, 0.45), M.stub, head, -0.01, 0.01, 0); sh.rotation.z = 0.25; sh.scale.set(1, 1.1, 0.93); }
-  else { const cap = mesh(capGeo(0.112, hs === 4 || hs === 2 ? 0.5 : 0.44), M.hair, head, -0.012, 0.012, 0); cap.scale.set(1, 1.12, 0.94); cap.rotation.z = 0.25; }
-  if (hs === 1) for (let i = 0; i < 9; i++) { const a = (i / 9) * Math.PI * 2; const sp = mesh(new THREE.ConeGeometry(0.022, 0.06, 6), M.hair, head, -0.01 + Math.cos(a) * 0.05, 0.12, Math.sin(a) * 0.05); sp.rotation.set(Math.sin(a) * 0.5, 0, -Math.cos(a) * 0.5); }
   if (hs === 2) {
-    const back = mesh(new THREE.CapsuleGeometry(0.085, 0.2, 6, 14), M.hair, head, -0.06, -0.09, 0); back.scale.set(0.55, 1, 1.18);
-    for (const s of [-1, 1]) { const lock = mesh(new THREE.CapsuleGeometry(0.025, 0.12, 4, 8), M.hair, head, 0.0, -0.06, s * 0.09); lock.rotation.x = s * 0.1; }
+    const back = mesh(new THREE.CapsuleGeometry(0.08, 0.17, 8, 18), M.hair, head, -0.058, -0.085, 0); back.scale.set(0.55, 1, 1.16);
+    for (const s of [-1, 1]) { const lock = mesh(new THREE.CapsuleGeometry(0.022, 0.11, 6, 10), M.hair, head, 0.005, -0.06, s * 0.086); lock.rotation.x = s * 0.08; }
   }
-  if (hs === 3) { const tail = mesh(new THREE.CapsuleGeometry(0.032, 0.18, 6, 10), M.hair, head, -0.135, -0.05, 0); tail.rotation.z = -0.45; const tie = mesh(new THREE.TorusGeometry(0.03, 0.009, 6, 12), M.band, head, -0.11, 0.03, 0); tie.rotation.y = Math.PI / 2; }
-  if (hs === 4) for (let i = 0; i < 30; i++) { const th = Math.random() * Math.PI * 2, ph = Math.random() * 1.25; mesh(sph(0.032, 8, 6), M.hair, head, -0.015 + Math.sin(ph) * Math.cos(th) * 0.112, 0.012 + Math.cos(ph) * 0.124, Math.sin(ph) * Math.sin(th) * 0.106); }
-  if (hs === 6) mesh(sph(0.046, 14, 12), M.hair, head, -0.09, 0.09, 0);
-  if (hs === 7) { // fletter i hestehale
-    const tie = mesh(new THREE.TorusGeometry(0.032, 0.012, 6, 14), M.band, head, -0.1, 0.05, 0); tie.rotation.set(0, Math.PI / 2, 0.6);
-    for (let i = 0; i < 11; i++) { const t = i / 10; const r = 0.03 - t * 0.012; mesh(sph(r, 10, 8), M.hair, head, -0.12 - t * 0.07, 0.03 - t * 0.33, (i % 2 ? 0.008 : -0.008)); }
+  if (hs === 3) { const tail = mesh(new THREE.CapsuleGeometry(0.03, 0.17, 8, 12), M.hair, head, -0.13, -0.05, 0); tail.rotation.z = -0.45; const tie = mesh(new THREE.TorusGeometry(0.028, 0.008, 6, 14), M.band, head, -0.108, 0.03, 0); tie.rotation.y = Math.PI / 2; }
+  if (hs === 6) mesh(sph(0.044, 18, 14), M.hair, head, -0.09, 0.088, 0);
+  if (hs === 7) {
+    const tie = mesh(new THREE.TorusGeometry(0.03, 0.011, 6, 14), M.band, head, -0.1, 0.05, 0); tie.rotation.set(0, Math.PI / 2, 0.6);
+    for (let i = 0; i < 12; i++) { const t = i / 11; mesh(sph(0.028 - t * 0.011, 10, 8), M.hair, head, -0.118 - t * 0.07, 0.03 - t * 0.33, (i % 2 ? 0.007 : -0.007)); }
   }
   // hodeplagg: 0 pannebånd, 1 caps, 2 bøttehatt, 3 visir, 4 ingen, 5 caps bakvendt
   const w = L.w;
@@ -988,22 +1417,30 @@ function buildHuman(look, h, opts) {
   for (const s of [-1, 1]) {
     const sh = new THREE.Group(); sh.position.set(0, 0.475, s * 0.195 * bw); chest.add(sh);
     mesh(sph(0.066 * bw, 16, 12), M.shirt, sh);
-    const upper = new THREE.Group(); sh.add(upper);
-    limb('upper', M.skin, upper);
+    const upper = new THREE.Bone(); sh.add(upper);
     const sleeveLen = outfit === 3 ? 0.31 : outfit === 2 ? 0.08 : 0.15;
     mesh(new THREE.CylinderGeometry(0.067 * bw, 0.061 * bw, sleeveLen, 18), M.shirt, upper, 0, -sleeveLen / 2 + 0.02, 0);
-    const fore = new THREE.Group(); fore.position.y = -UPPER; upper.add(fore);
-    mesh(sph(0.043 * bw, 12, 10), outfit === 3 ? M.shirt : M.skin, fore);
-    limb('fore', outfit === 3 ? M.shirt : M.skin, fore);
-    if (L.wb && !opts.noRacket) mesh(new THREE.CylinderGeometry(0.038, 0.036, 0.07, 14), M.band, fore, 0, -0.225, 0);
-    const hand = mesh(sph(0.042, 14, 12), M.skin, fore, 0, -FORE - 0.035, 0); hand.scale.set(0.85, 1.2, 0.62);
-    const thumb = mesh(new THREE.CapsuleGeometry(0.012, 0.03, 4, 8), M.skin, fore, 0.022, -FORE - 0.02, s * 0.02); thumb.rotation.x = s * 0.5;
-    arms[s] = { sh, upper, fore };
+    const fore = new THREE.Bone(); fore.position.y = -UPPER; upper.add(fore);
+    skinLimb('arm', outfit === 3 ? M.shirt : M.skin, sh, upper, fore, s);
+    mesh(sph(0.02 * bw, 12, 10), outfit === 3 ? M.shirt : M.skin, fore, -0.012, 0.004, 0).scale.set(0.8, 1.1, 1); // olecranon fyller albuen når den bøyes
+    const wrist = new THREE.Group(); fore.add(wrist);
+    if (L.wb && !opts.noRacket) mesh(new THREE.CylinderGeometry(0.036, 0.034, 0.07, 18), M.band, wrist, 0, -0.225, 0);
+    const hand = new THREE.Group(); hand.position.y = -FORE; hand.scale.z = s; wrist.add(hand);
+    mesh(sph(0.028, 18, 14), M.skin, hand, -0.006, -0.026, 0.016).scale.set(0.9, 1.4, 0.48);   // håndflate/håndrygg
+    mesh(sph(0.024, 14, 10), M.skin, hand, -0.012, -0.01, 0.006).scale.set(1, 1.1, 0.9);       // tommelballe
+    for (let i = 0; i < 4; i++) {
+      const fg = new THREE.TorusGeometry(0.0215 - i * 0.0008, 0.0083 - i * 0.0006, 8, 14, Math.PI * (1.18 - i * 0.03)); fg.rotateZ(-Math.PI / 2);
+      const f = mesh(fg, M.skin, hand, 0.001, -0.02 - i * 0.0168, 0.001); f.rotation.x = -Math.PI / 2;
+      mesh(sph(0.0088 - i * 0.0006, 10, 8), M.skin, hand, 0.0035, -0.02 - i * 0.0168, 0.02);    // knoke
+    }
+    const tg = new THREE.TorusGeometry(0.023, 0.0092, 8, 12, Math.PI * 0.62); tg.rotateZ(Math.PI * 0.86);
+    const th = mesh(tg, M.skin, hand, 0, -0.008, 0); th.rotation.set(-Math.PI / 2, 0, 0.25);
+    arms[s] = { sh, upper, fore, wrist };
   }
   // --- racket ---
   let racket = null;
   if (!opts.noRacket) {
-    racket = new THREE.Group(); arms[h].fore.add(racket);
+    racket = new THREE.Group(); arms[h].wrist.add(racket);
     mesh(new THREE.CylinderGeometry(0.0175, 0.0165, 0.2, 8), M.grip, racket, 0, -0.34, 0);
     mesh(new THREE.CylinderGeometry(0.02, 0.02, 0.015, 8), M.frame, racket, 0, -0.238, 0);
     for (const s of [-1, 1]) { const th = mesh(new THREE.CylinderGeometry(0.009, 0.011, 0.15, 6), M.frame, racket, s * 0.03, -0.503, 0); th.rotation.z = -s * 0.42; }
@@ -1013,17 +1450,19 @@ function buildHuman(look, h, opts) {
     const strings = new THREE.Mesh(new THREE.CircleGeometry(0.122, 40), new THREE.MeshStandardMaterial({ map: stringsTex, transparent: true, side: THREE.DoubleSide, roughness: 0.6, depthWrite: false }));
     strings.scale.y = 1.3; strings.position.y = headY; racket.add(strings);
   }
+  root.updateMatrixWorld(true);
+  for (const [m, b0, b1] of skinned) m.bind(new THREE.Skeleton([b0, b1]));
   return { root, hips, chest, head, legs, arms, racketArm: arms[h], offArm: arms[-h], racket, h, bw,
     anim: { run: 0, air: 0, rt: null, ot: null, twist: 0, lean: 0.15, prep: 0, hy: 0, hp: 0 } };
 }
 function disposeHuman(hm) {
   if (!hm) return;
-  hm.root.traverse(o => { if (o.isMesh) { o.geometry.dispose(); o.material.dispose(); } });
+  hm.root.traverse(o => { if (o.isMesh) { if (!o.userData.sharedGeo) o.geometry.dispose(); o.material.dispose(); if (o.isSkinnedMesh) o.skeleton.dispose(); } });
   if (hm.root.parent) hm.root.parent.remove(hm.root);
 }
 
 // 2-ledds IK for armen: målet er i verdenskoordinater
-function ikArm(arm, target, pole, L1, L2) {
+function ikArm(arm, target, pole, L1, L2, dt) {
   const sh = arm.sh;
   sh.updateWorldMatrix(true, false);
   const T = sh.worldToLocal(_t.copy(target));
@@ -1036,21 +1475,34 @@ function ikArm(arm, target, pole, L1, L2) {
   const n = P.sub(dir.clone().multiplyScalar(P.dot(dir)));
   if (n.lengthSq() < 1e-6) n.set(1, 0, 0);
   n.normalize();
+  if (dt) {
+    if (arm._n) { n.lerp(arm._n, Math.exp(-dt * 22)); n.addScaledVector(dir, -n.dot(dir)); if (n.lengthSq() < 1e-6) n.copy(arm._n); n.normalize(); }
+    arm._n = (arm._n || new THREE.Vector3()).copy(n);
+  }
+  const nn = n.clone();
   const elbow = dir.clone().multiplyScalar(Math.cos(A) * L1).add(n.multiplyScalar(Math.sin(A) * L1));
-  arm.upper.quaternion.setFromUnitVectors(DOWN, elbow.clone().normalize());
+  const u = elbow.clone().normalize();
+  arm.upper.quaternion.setFromUnitVectors(DOWN, u);
+  const fd = dir.clone().multiplyScalar(d).sub(elbow).addScaledVector(nn, -0.04);
+  fd.addScaledVector(u, -fd.dot(u));
+  if (fd.lengthSq() > 1e-8) {
+    fd.normalize();
+    const cx = V3(1, 0, 0).applyQuaternion(arm.upper.quaternion);
+    arm.upper.quaternion.premultiply(_q2.setFromAxisAngle(u, Math.atan2(u.dot(cx.clone().cross(fd)), cx.dot(fd))));
+  }
   const w = dir.multiplyScalar(d).sub(elbow).normalize().applyQuaternion(_q2.copy(arm.upper.quaternion).invert());
   arm.fore.quaternion.setFromUnitVectors(DOWN, w);
 }
 function rollRacket(arm, desired) {
-  arm.fore.updateWorldMatrix(true, false);
-  arm.fore.getWorldQuaternion(_q);
+  arm.wrist.updateWorldMatrix(true, false);
+  arm.wrist.getWorldQuaternion(_q);
   const axis = V3(0, 1, 0).applyQuaternion(_q);
   const cur = V3(0, 0, 1).applyQuaternion(_q);
   const des = desired.clone().sub(axis.clone().multiplyScalar(desired.dot(axis)));
-  if (des.lengthSq() < 1e-6) return;
+  if (des.lengthSq() < 0.06) return;
   des.normalize();
   const ang = Math.atan2(axis.dot(cur.clone().cross(des)), cur.dot(des));
-  arm.fore.quaternion.multiply(_qr.setFromAxisAngle(YAXIS, ang));
+  arm.wrist.quaternion.multiply(_qr.setFromAxisAngle(YAXIS, ang));
 }
 function legExtent(th, kn, ab) { return (THIGH * Math.cos(th) + SHIN * Math.cos(th - kn)) * Math.cos(ab) + ANKLE_H; }
 function setLeg(leg, th, kn, ab) {
@@ -1060,171 +1512,197 @@ function setLeg(leg, th, kn, ab) {
 }
 function bez(a, c, b, t) { const u = 1 - t; return V3(u * u * a.x + 2 * u * t * c.x + t * t * b.x, u * u * a.y + 2 * u * t * c.y + t * t * b.y, u * u * a.z + 2 * u * t * c.z + t * t * b.z); }
 
+// Kritisk dempet fjær (eksakt løsning) – gir myke, naturlige overganger uten rykk eller sleng.
+function springV(p, v, target, w, dt) {
+  const e = Math.exp(-w * dt);
+  for (const k of ['x', 'y', 'z']) { const x0 = p[k] - target[k]; const tmp = (v[k] + w * x0) * dt; p[k] = target[k] + (x0 + tmp) * e; v[k] = (v[k] - w * tmp) * e; }
+}
+function springS(o, key, target, w, dt) {
+  const vk = key + 'V', e = Math.exp(-w * dt);
+  const x0 = o[key] - target, tmp = ((o[vk] || 0) + w * x0) * dt;
+  o[key] = target + (x0 + tmp) * e; o[vk] = ((o[vk] || 0) - w * tmp) * e;
+}
+const L3 = (x, y, z) => new THREE.Vector3(x, y, z);
+const bezL = (a, c, b, t) => { const u = 1 - t; return L3(u * u * a.x + 2 * u * t * c.x + t * t * b.x, u * u * a.y + 2 * u * t * c.y + t * t * b.y, u * u * a.z + 2 * u * t * c.z + t * t * b.z); };
+
 // Stiller hele kroppen for én frame. st beskriver spilleren i "spillrom" (x langs banen, y høyde).
+// Armmålene settes i overkroppens eget koordinatsystem (x frem, y opp, z mot racketsiden når h = 1),
+// slik at armene følger rotasjonen i kroppen – som hos en ekte spiller.
 function poseHuman(hm, st) {
-  const A = hm.anim, d = st.d, h = hm.h, dt = Math.min(st.dt || 0.016, 0.05);
-  const k1 = 1 - Math.pow(0.0001, dt), k2 = 1 - Math.pow(0.002, dt);
+  const A = hm.anim, d = st.d, h = hm.h, dt = clamp(st.dt || 0.016, 0.001, 0.05);
+  const k1 = 1 - Math.pow(0.0001, dt);
   const space = hm.root.parent;
   if (space && !space.isScene) space.updateMatrixWorld(true);
-  let worldT = false;
-  const W = v => worldT ? v : (space ? space.localToWorld(v) : v);
+  const W = v => (space ? space.localToWorld(v) : v);
   hm.root.position.set(st.x, st.y, st.z);
   hm.root.rotation.y = st.yaw != null ? st.yaw : (d > 0 ? -0.34 : Math.PI + 0.34);
   const speed = Math.abs(st.vx || 0);
   const runAmt = st.onGround ? clamp(speed / PSPEED, 0, 1) : 0;
   const back = (st.vx || 0) * d < -0.3;
-  A.run = lerp(A.run, runAmt, k1 * 0.6);
-  A.air = lerp(A.air, st.onGround ? 0 : 1, k1);
-  const ready = 1 - A.run;
+  springS(A, 'run', runAmt, 9, dt);
+  springS(A, 'air', st.onGround ? 0 : 1, 16, dt);
+  const run = clamp(A.run, 0, 1), air = clamp(A.air, 0, 1), ready = 1 - run;
   const ph = (st.run || 0) * (back ? -1 : 1);
   const t = st.t || 0;
   const swinging = st.swT > 0;
-  // bein
+  const fh = swinging && !st.swOver, oh = swinging && st.swOver;
+  // ---- bein ----
   const legVals = [];
   for (const leg of hm.legs) {
     const phi = ph + (leg.s > 0 ? 0 : Math.PI);
     const amp = back ? 0.45 : 0.75;
-    let th = lerp(0.2 + leg.s * h * 0.06, amp * Math.sin(phi) + 0.12, A.run);
-    let kn = lerp(0.4, 0.25 + 1.25 * Math.max(0, Math.cos(phi)) * (back ? 0.6 : 1), A.run);
-    let ab = lerp(0.15, 0.03, A.run);
-    if (swinging && !st.swOver) { th += leg.s * h * 0.12; kn += 0.1; }
-    th = lerp(th, 0.55 + leg.s * 0.12, A.air); kn = lerp(kn, 1.15, A.air);
+    let th = lerp(0.32 + leg.s * h * 0.05, amp * Math.sin(phi) + 0.12, run);
+    let kn = lerp(0.6, 0.25 + 1.25 * Math.max(0, Math.cos(phi)) * (back ? 0.6 : 1), run);
+    let ab = lerp(0.16, 0.03, run);
+    if (fh) { th += leg.s * h * 0.14; kn += 0.12; ab += 0.04; }   // åpen stilling i slaget
+    if (oh && !st.onGround) { th = 0.35 + leg.s * 0.2; kn = 0.9; }
+    th = lerp(th, 0.55 + leg.s * 0.12, air); kn = lerp(kn, 1.15, air);
     if (st.pose === 'seated') { th = 1.5; kn = 1.55; ab = 0.06; }
     if (st.pose === 'crouch') { th = 1.15; kn = 2.0; ab = 0.18; }
     setLeg(leg, th, kn, ab); legVals.push([th, kn, ab]);
   }
   let hipY = Math.max(legExtent(...legVals[0]), legExtent(...legVals[1]));
   if (!st.onGround) hipY = HIP_H - 0.06;
-  if (ready > 0.5 && st.onGround && !swinging && !st.pose) hipY += Math.sin(t * 6.5) * 0.008;
+  if (ready > 0.5 && st.onGround && !swinging && !st.pose && !st.holding) hipY += Math.max(0, Math.sin(t * 5.2)) * 0.012; // lett vipping på tærne
   if (st.pose === 'seated') hipY = st.seatH || 0.55;
   if (st.pose === 'crouch') hipY = legExtent(1.15, 2.0, 0.18);
   hm.hips.position.y = hipY;
   hm.hips.rotation.set(0, 0, 0);
-  // overkropp
-  let lean = 0.16 * ready + (back ? -0.04 : 0.3) * A.run;
-  let twist = 0;
-  const z0 = st.z;
-  const base = V3(st.x, st.y, BALLZ);
-  const zoneHit = V3(st.x + d * 0.62, st.y + 0.95, BALLZ);
-  const zoneSm = V3(st.x + d * 0.28, st.y + 2.4, BALLZ);
-  const ball = st.ball;
-  let rt, ot, instant = false;
-  const coil = -0.95 * h, thru = 0.85 * h;
-  const ready_rt = V3(st.x + d * 0.55, st.y + 1.42 + Math.sin(t * 6.5) * 0.01, BALLZ + 0.08);
-  const ready_ot = V3(st.x + d * 0.4, st.y + 1.22, BALLZ - 0.1);
+
+  // ---- sittende/hukende figurer (dommere, ballgutter, fotografer) ----
   if (st.pose === 'seated' || st.pose === 'crouch') {
+    hm.chest.rotation.set(0, 0, st.pose === 'seated' ? -0.05 : -0.55);
     hm.root.updateMatrixWorld(true);
-    worldT = true;
     const kneeY = st.pose === 'seated' ? hipY + 0.08 : 0.5;
     const kx = st.pose === 'seated' ? 0.38 : 0.42;
-    rt = hm.root.localToWorld(V3(kx, kneeY, 0.16)); ot = hm.root.localToWorld(V3(kx, kneeY, -0.16));
-    lean = st.pose === 'seated' ? 0.05 : 0.55;
-  } else if (swinging && !st.swOver) {
-    // forehand: bakover → treff → gjennomsving over skulderen
-    instant = true;
-    const B = V3(st.x - d * 0.75, st.y + 1.2, BALLZ + 0.3);
-    let Cp = zoneHit.clone();
-    if (ball && ball.distanceTo(zoneHit) < 2.2) Cp.lerp(ball, 0.85);
-    const F = V3(st.x - d * 0.05, st.y + 1.65, BALLZ - 0.5);
-    if (st.hitT > 0) {
-      const v = smooth(clamp((st.swT - st.hitT) / 0.22, 0, 1));
-      const C0 = st.hitPos || Cp;
-      rt = bez(C0, C0.clone().add(V3(d * 0.6, 0.45, -0.1)), F, v);
-      twist = lerp(0.15 * h, thru, v);
-    } else if (st.swT <= SW_ACTIVE) {
-      const u = smooth(clamp(st.swT / SW_ACTIVE, 0, 1));
-      const ctrl = B.clone().lerp(Cp, 0.5).add(V3(0, -0.4, 0.25));
-      rt = bez(B, ctrl, Cp, u);
-      twist = lerp(coil, 0.15 * h, u);
-    } else {
-      const v = smooth(clamp((st.swT - SW_ACTIVE) / (SW_DUR - SW_ACTIVE), 0, 1));
-      rt = bez(Cp, Cp.clone().add(V3(d * 0.6, 0.45, -0.1)), F, v);
-      twist = lerp(0.15 * h, thru, v);
-    }
-    ot = V3(st.x + d * 0.4, st.y + 1.3, BALLZ - 0.55);
-    lean = 0.22;
-  } else if (swinging && st.swOver) {
-    // serve / smash: trofeposisjon → racketen faller bak ryggen → treff høyt → gjennom ned
-    instant = true;
-    const Tr = V3(st.x - d * 0.1, st.y + 2.0, BALLZ + 0.12);
-    const Drop = V3(st.x - d * 0.45, st.y + 1.3, BALLZ + 0.15);
-    let Cp = zoneSm.clone();
-    if (ball && ball.distanceTo(zoneSm) < 1.8) Cp.lerp(ball, 0.85);
-    const F = V3(st.x + d * 0.4, st.y + 0.7, BALLZ - 0.45);
-    if (st.hitT > 0) {
-      const v = smooth(clamp((st.swT - st.hitT) / 0.22, 0, 1));
-      const C0 = st.hitPos || Cp;
-      rt = bez(C0, C0.clone().add(V3(d * 0.8, 0.0, 0)), F, v);
-      twist = lerp(0.2 * h, 0.75 * h, v);
-    } else if (st.swT <= SW_ACTIVE) {
-      const u = clamp(st.swT / SW_ACTIVE, 0, 1);
-      rt = u < 0.35 ? Tr.clone().lerp(Drop, smooth(u / 0.35)) : bez(Drop, V3(st.x - d * 0.15, st.y + 2.7, BALLZ), Cp, smooth((u - 0.35) / 0.65));
-      twist = lerp(-0.6 * h, 0.2 * h, u);
-    } else {
-      const v = smooth(clamp((st.swT - SW_ACTIVE) / (SW_DUR - SW_ACTIVE), 0, 1));
-      rt = bez(Cp, Cp.clone().add(V3(d * 0.8, 0, 0)), F, v);
-      twist = lerp(0.2 * h, 0.75 * h, v);
-    }
-    ot = st.hitT > 0 || st.swT > SW_ACTIVE ? V3(st.x + d * 0.25, st.y + 1.2, BALLZ - 0.4) : V3(st.x + d * 0.42, st.y + 2.15, BALLZ - 0.2); // frie armen peker mot ballen før treff
-    lean = 0.05;
-  } else if (st.holding) {
-    rt = V3(st.x + d * 0.42, st.y + 1.0, BALLZ + 0.08);
-    ot = V3(st.x + d * 0.32, st.y + 1.15, BALLZ);
-    lean = 0.12;
-  } else if (st.tossing) {
-    rt = V3(st.x - d * 0.12, st.y + 1.95, BALLZ + 0.15);
-    ot = V3(st.x + d * 0.32, st.y + 2.25, BALLZ - 0.05);
-    twist = -0.5 * h; lean = -0.05;
-  } else if (st.celebrate > 0) {
-    rt = V3(st.x + d * 0.1, st.y + 2.15 + Math.sin(t * 10) * 0.05, BALLZ + 0.1);
-    ot = V3(st.x + d * 0.3, st.y + 1.5 + Math.max(0, Math.sin(t * 12)) * 0.15, z0 - 0.3);
-    lean = -0.05;
-  } else if (st.celebrate < 0) {
-    rt = V3(st.x + d * 0.15, st.y + 0.55, BALLZ + 0.1);
-    ot = V3(st.x + d * 0.05, st.y + 0.75, z0 - 0.28);
-    lean = 0.35;
-  } else if (A.air > 0.5) {
-    rt = V3(st.x + d * 0.3, st.y + 1.85, BALLZ + 0.1);
-    ot = V3(st.x + d * 0.45, st.y + 1.6, z0 - 0.3);
-  } else {
-    // klarstilling / løping, med forberedelse (racketen tas tilbake før ballen kommer)
-    const sway = Math.sin(ph) * A.run;
-    rt = ready_rt.clone().add(V3(-d * 0.12 * A.run, 0.05 * Math.sin(ph * 2) * A.run, 0));
-    ot = ready_ot.clone().lerp(V3(st.x + d * (0.08 + 0.38 * sway), st.y + 1.0 + 0.06 * Math.cos(ph), z0 - 0.33), A.run);
-    const prep = st.prep || 0;
-    A.prep = lerp(A.prep, prep, k2 * 0.6);
-    if (A.prep > 0.01) {
-      rt.lerp(V3(st.x - d * 0.7, st.y + 1.2, BALLZ + 0.3), A.prep * 0.85);
-      ot.lerp(V3(st.x + d * 0.5, st.y + 1.25, BALLZ - 0.45), A.prep * 0.7);
-      twist = coil * A.prep * 0.8;
-    }
+    const rt = hm.root.localToWorld(L3(kx, kneeY, 0.16)), ot = hm.root.localToWorld(L3(kx, kneeY, -0.16));
+    hm.root.getWorldQuaternion(_q);
+    lookHead(hm, A, st, W, k1);
+    ikArm(hm.racketArm, rt, L3(-0.3, -1, 0.5).applyQuaternion(_q), UPPER, FORE + 0.03);
+    ikArm(hm.offArm, ot, L3(-0.3, -1, -0.5).applyQuaternion(_q), UPPER, FORE + 0.03);
+    return;
   }
-  A.lean = lerp(A.lean, lean, k2);
-  A.twist = instant ? twist : lerp(A.twist, twist, k2);
+
+  // ---- overkropp: vridning og foroverbøy ----
+  const coil = -0.9 * h;
+  if (!A.rp) { A.rp = L3(0.48, 0.3, 0.06 * h); A.rv = L3(0, 0, 0); A.op = L3(0.36, 0.22, -0.02 * h); A.ov = L3(0, 0, 0); A.fn = L3(0.2, 0.1, h); A.fnv = L3(0, 0, 0); A.twist = 0; A.lean = 0.15; A.oh = 0; A.two = 1; A.prep = 0; }
+  // forberedelse (unit turn) når ballen er på vei
+  springS(A, 'prep', st.prep || 0, 7, dt);
+  let twistT = 0, leanT = 0.24 * ready + (back ? -0.04 : 0.3) * run;
+  // swing-fase: 0 før treff (frem mot ballen), 1 etter treff/sving forbi (gjennomsving)
+  const tC = st.hitT > 0 ? st.hitT : 0.15;
+  const after = swinging && (st.hitT > 0 || st.swT > SW_ACTIVE);
+  const fwdU = swinging ? smooth(clamp(st.swT / tC, 0, 1)) : 0;
+  const folU = after ? smooth(clamp((st.swT - (st.hitT > 0 ? st.hitT : SW_ACTIVE)) / 0.26, 0, 1)) : 0;
+  if (fh) { twistT = after ? lerp(0.1 * h, 0.75 * h, folU) : lerp(coil, 0.1 * h, fwdU); leanT = 0.24; }
+  else if (oh) { twistT = after ? lerp(0.2 * h, 0.7 * h, folU) : lerp(-0.55 * h, 0.2 * h, fwdU); leanT = after ? lerp(0.0, 0.35, folU) : -0.08; }
+  else if (st.tossing) { twistT = -0.55 * h; leanT = -0.1; }
+  else if (st.holding) { twistT = -0.15 * h; leanT = 0.18; }
+  else if (st.celebrate > 0) { leanT = -0.08; }
+  else if (st.celebrate < 0) { leanT = 0.4; }
+  else twistT = coil * A.prep * 0.9;
+  springS(A, 'twist', twistT, swinging ? 28 : 9, dt);
+  springS(A, 'lean', leanT, 10, dt);
   hm.chest.rotation.set(0, A.twist, -A.lean);
-  // hode ser på ballen
   hm.root.updateMatrixWorld(true);
+  lookHead(hm, A, st, W, k1);
+  const toLocal = wv => hm.chest.worldToLocal(wv.clone());
+  const toWorld = lv => hm.chest.localToWorld(lv.clone());
+  const ballL = st.ball ? toLocal(W(st.ball.clone())) : null;
+
+  // ---- mål for racketen (treffpunktet på strengene) og den frie hånden, i overkroppens rom ----
+  const READY = L3(0.48, 0.3 + Math.max(0, Math.sin(t * 5.2)) * 0.01, 0.06 * h);
+  const TAKEBACK = L3(-0.6, 0.45, 0.52 * h), SLOT = L3(-0.3, 0.0, 0.52 * h), FOLLOW = L3(0.08, 0.66, -0.36 * h);
+  const OFF_POINT = L3(0.5, 0.42, -0.04 * h), OFF_TUCK = L3(0.14, 0.2, -0.3 * h);
+  const TROPHY = L3(-0.2, 0.98, 0.36 * h), DROP = L3(-0.55, 0.12, 0.3 * h), OH_FOLLOW = L3(0.36, -0.15, -0.28 * h);
+  let rT, oT, wR = 13, wO = 11, ohT = 0, twoT = 0, fnT = L3(0.25, 0.15, h);
+  if (fh) {
+    let C = L3(0.55, 0.0, 0.42 * h);
+    if (ballL && ballL.distanceTo(C) < 1.6) C = C.lerp(ballL, 0.85);
+    if (!after) {
+      if (!A.sw0 || A.swId !== st.swId) { A.sw0 = A.rp.clone(); A.swId = st.swId; }
+      rT = bezL(A.sw0, SLOT, C, fwdU); oT = OFF_POINT.clone().lerp(L3(0.25, 0.3, -0.24 * h), fwdU);
+      fnT = L3(1, 0.1, 0.25 * h); wR = 55; wO = 20;
+    } else {
+      if (!A.hitL || A.hitId !== st.swId) { A.hitL = A.rp.clone(); A.hitId = st.swId; }
+      rT = bezL(A.hitL, A.hitL.clone().add(L3(0.35, 0.45, -0.1 * h)), FOLLOW, folU); oT = OFF_TUCK.clone();
+      fnT = L3(0.6, 0.4, -0.3 * h); wR = 34; wO = 16;
+    }
+  } else if (oh) {
+    ohT = 1;
+    let C = L3(0.32, 1.45, 0.18 * h);
+    if (ballL && ballL.distanceTo(C) < 1.4) C = C.lerp(ballL, 0.85);
+    if (!after) {
+      if (!A.sw0 || A.swId !== st.swId) { A.sw0 = A.rp.clone(); A.swId = st.swId; }
+      const u = clamp(st.swT / tC, 0, 1);
+      rT = u < 0.35 ? A.sw0.clone().lerp(DROP, smooth(u / 0.35)) : bezL(DROP, L3(-0.1, 1.55, 0.3 * h), C, smooth((u - 0.35) / 0.65));
+      oT = L3(0.3, 0.95, -0.05 * h).lerp(L3(0.22, 0.32, -0.14 * h), smooth(u));
+      fnT = L3(1, 0.3, 0); wR = 55; wO = 18;
+    } else {
+      if (!A.hitL || A.hitId !== st.swId) { A.hitL = A.rp.clone(); A.hitId = st.swId; }
+      rT = bezL(A.hitL, A.hitL.clone().add(L3(0.55, 0.05, 0)), OH_FOLLOW, folU); oT = L3(0.18, 0.25, -0.2 * h);
+      fnT = L3(0.4, -0.6, -0.4 * h); wR = 34; wO = 14;
+    }
+  } else if (st.holding) {
+    // servestilling: ballen i den frie hånden, racketen pekende mot banen
+    rT = L3(0.38, 0.16, 0.2 * h); oT = st.heldW ? toLocal(st.heldW) : L3(0.35, 0.2, -0.05 * h); wO = 18;
+    fnT = L3(0.2, 0.2, h);
+  } else if (st.tossing) {
+    if (!A.toss0) { A.toss0 = A.rp.clone(); A.tossT = 0; }
+    A.tossT += dt;
+    const u = smooth(clamp(A.tossT / 0.75, 0, 1));
+    ohT = smooth(clamp((A.tossT - 0.2) / 0.5, 0, 1));
+    rT = bezL(A.toss0, L3(-0.5, -0.12, 0.42 * h), TROPHY, u); oT = L3(0.3, 1.02, -0.04 * h); wR = 26; wO = 9;
+    fnT = L3(0.3, 0.3, h);
+  } else if (st.celebrate > 0) {
+    ohT = 1;
+    rT = L3(0.15, 1.15 + Math.sin(t * 9) * 0.04, 0.3 * h); oT = L3(0.3, 0.55 + Math.max(0, Math.sin(t * 11)) * 0.18, -0.24 * h); wR = 8; wO = 12;
+  } else if (st.celebrate < 0) {
+    rT = L3(0.2, -0.22, 0.26 * h); oT = L3(0.12, -0.12, -0.26 * h); wR = 6; wO = 6;
+  } else if (air > 0.5) {
+    rT = L3(0.25, 0.75, 0.25 * h); oT = L3(0.35, 0.65, -0.2 * h);
+  } else {
+    // klarstilling / løping: begge hender på racketen; ved løping pumper den frie armen
+    const sway = Math.sin(ph);
+    rT = READY.clone().lerp(L3(0.4, 0.2 + 0.03 * Math.sin(ph * 2), 0.14 * h), run);
+    twoT = clamp(1 - run * 1.4, 0, 1);
+    oT = L3(0.12 + 0.28 * sway, 0.12 + 0.05 * Math.cos(ph), -0.27 * h);
+    if (A.prep > 0.02) { rT = bezL(rT, L3(0.12, 0.5, 0.75 * h), TAKEBACK, smooth(A.prep)); oT.lerp(OFF_POINT, A.prep); twoT *= 1 - A.prep; } // racketen går i bue ut til siden og bak
+  }
+  if (!st.tossing) A.toss0 = null;
+  // myk overgang fra gjennomsving tilbake til klarstilling (ingen rykk når svingen slutter)
+  A.since = swinging ? 0 : (A.since || 0) + dt;
+  if (!swinging && !st.tossing && !st.holding) { const rec = lerp(0.55, 1, smooth(clamp(A.since / 0.45, 0, 1))); wR *= rec; wO *= rec; }
+  springS(A, 'oh', ohT, 12, dt);
+  springS(A, 'two', twoT, 12, dt);
+  springV(A.rp, A.rv, rT, wR, dt);
+  // ---- racketarm ----
+  const poleR = toWorld(L3(-0.4, -1, 0.55 * h).lerp(L3(-0.45, 0.35, 1.0 * h), A.oh)).sub(toWorld(L3(0, 0, 0)));
+  ikArm(hm.racketArm, toWorld(A.rp), poleR, UPPER, hm.racket ? RACKET_C : FORE + 0.03, dt);
+  if (hm.racket) {
+    springV(A.fn, A.fnv, fnT.clone().normalize(), 10, dt);
+    rollRacket(hm.racketArm, toWorld(A.fn).sub(toWorld(L3(0, 0, 0))).normalize());
+  }
+  // ---- fri hånd: på racketens hals i klarstilling, ellers egne mål ----
+  if (hm.racket && A.two > 0.01) {
+    hm.racket.updateWorldMatrix(true, false);
+    const throat = toLocal(hm.racket.localToWorld(L3(0, -0.53, 0)));
+    oT = oT.clone().lerp(throat, A.two);
+    wO = lerp(wO, 30, A.two);
+  }
+  springV(A.op, A.ov, oT, wO, dt);
+  const poleO = toWorld(L3(-0.3, -1, -0.55 * h).lerp(L3(-0.2, -0.2, -1 * h), A.oh)).sub(toWorld(L3(0, 0, 0)));
+  ikArm(hm.offArm, toWorld(A.op), poleO, UPPER, FORE + 0.03, dt);
+}
+
+function lookHead(hm, A, st, W, k1) {
   if (st.look) {
     const lt = hm.chest.worldToLocal(W(st.look.clone())).sub(hm.head.position);
-    const yaw = clamp(Math.atan2(-lt.z, lt.x), -1.2, 1.2);
-    const pitch = clamp(Math.atan2(lt.y, Math.hypot(lt.x, lt.z)), -0.7, 0.6);
-    A.hy = lerp(A.hy, yaw, k1); A.hp = lerp(A.hp, st.celebrate < 0 ? -0.5 : pitch, k1);
+    const yaw = clamp(Math.atan2(-lt.z, lt.x), -1.1, 1.1);
+    const pitch = clamp(Math.atan2(lt.y, Math.hypot(lt.x, lt.z)), -0.6, 0.55);
+    A.hy = lerp(A.hy || 0, yaw, k1 * 0.8); A.hp = lerp(A.hp || 0, st.celebrate < 0 ? -0.5 : pitch, k1 * 0.8);
   }
-  hm.head.rotation.set(0, A.hy, A.hp, 'YXZ');
-  // armer
-  if (!A.rt || instant) A.rt = rt.clone(); else A.rt.lerp(rt, k1);
-  if (!A.ot) A.ot = ot.clone(); else A.ot.lerp(ot, instant ? k1 : k1 * 0.8);
-  let poleR, poleO;
-  if (worldT) {
-    hm.root.getWorldQuaternion(_q);
-    poleR = V3(-0.3, -1, 0.5).applyQuaternion(_q); poleO = V3(-0.3, -1, -0.5).applyQuaternion(_q);
-  } else {
-    poleR = W(V3(-d * 0.35, -1, 0.7)).sub(W(V3(0, 0, 0)));
-    poleO = W(V3(-d * 0.25, -1, -0.6)).sub(W(V3(0, 0, 0)));
-  }
-  ikArm(hm.racketArm, W(A.rt.clone()), poleR, UPPER, hm.racket ? RACKET_C : FORE + 0.03);
-  if (hm.racket) rollRacket(hm.racketArm, W(V3(d, 0.15, 0.85)).sub(W(V3(0, 0, 0))).normalize());
-  ikArm(hm.offArm, W(A.ot.clone()), poleO, UPPER, FORE + 0.03);
+  hm.head.rotation.set(0, A.hy || 0, A.hp || 0, 'YXZ');
 }
 
 // ---------- Scene ----------
@@ -1536,16 +2014,13 @@ function buildBall(scene) {
     g.strokeStyle = '#f7f7ef'; g.lineWidth = 7;
     g.beginPath(); for (let x = 0; x <= w; x += 2) { const y = h / 2 + Math.sin(x / w * Math.PI * 4) * h * 0.28; x ? g.lineTo(x, y) : g.moveTo(x, y); } g.stroke();
   });
-  const ball = new THREE.Mesh(new THREE.SphereGeometry(BR, 24, 16), stdMat('#ffffff', 0.7, 0, { map: tex, emissive: '#b8f000', emissiveIntensity: 0.45 }));
-  ball.castShadow = true; ball.scale.setScalar(1.75); scene.add(ball);
-  const glowTex = canvasTex(64, 64, (g, w, h) => { const gr = g.createRadialGradient(32, 32, 0, 32, 32, 32); gr.addColorStop(0, 'rgba(235,255,120,0.9)'); gr.addColorStop(0.35, 'rgba(220,255,80,0.35)'); gr.addColorStop(1, 'rgba(220,255,80,0)'); g.fillStyle = gr; g.fillRect(0, 0, w, h); });
-  const glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }));
-  glow.scale.setScalar(0.42 / 1.75); ball.add(glow);
+  const ball = new THREE.Mesh(new THREE.SphereGeometry(BR, 24, 16), stdMat('#ffffff', 0.92, 0, { map: tex }));
+  ball.castShadow = true; ball.scale.setScalar(1.45); scene.add(ball);
   const sh = canvasTex(64, 64, (g, w, h) => { const gr = g.createRadialGradient(32, 32, 2, 32, 32, 30); gr.addColorStop(0, 'rgba(0,0,0,.45)'); gr.addColorStop(1, 'rgba(0,0,0,0)'); g.fillStyle = gr; g.fillRect(0, 0, w, h); });
   const blob = new THREE.Mesh(new THREE.PlaneGeometry(0.32, 0.32), new THREE.MeshBasicMaterial({ map: sh, transparent: true, depthWrite: false }));
   blob.rotation.x = -Math.PI / 2; scene.add(blob);
   for (let i = 0; i < 6; i++) {
-    const m = new THREE.Mesh(new THREE.SphereGeometry(BR * 1.5, 10, 8), new THREE.MeshBasicMaterial({ color: '#efff70', transparent: true, opacity: 0.0, depthWrite: false }));
+    const m = new THREE.Mesh(new THREE.SphereGeometry(BR * 1.3, 10, 8), new THREE.MeshBasicMaterial({ color: '#d8ec5a', transparent: true, opacity: 0.0, depthWrite: false }));
     scene.add(m); G3.trail.push(m);
   }
   G3.ball = ball; G3.ballShadow = blob;
@@ -1573,7 +2048,7 @@ function drawScoreboard() {
 }
 
 // ---------- Kvalitet / 4K ----------
-const settings = { games: 3, diff: 1, gfx: 2 };
+const settings = { games: 3, diff: 1, gfx: 2, sound: 0 };
 function applyQuality() {
   if (!G3.ready) return;
   const stage = document.getElementById('stage');
@@ -1632,11 +2107,16 @@ function render3D(dt, t) {
       }
       let celebrate = 0;
       if ((gs.phase === 'dead' || gs.phase === 'over') && ms && ms.big && ms.w != null && celebAge < (gs.phase === 'over' ? 99 : 1.6)) celebrate = ms.w === p.side ? 1 : -1;
-      if (p.swT > 0 && p.hitDone && !p.hitPos && game.hitFlash) p.hitPos = V3(game.hitFlash.x, game.hitFlash.y, BALLZ);
-      if (p.swT === 0) p.hitPos = null;
+      if (p.swT > 0 && (!p._lastSw || p.swT < p._lastSw - 0.02)) p.swN = (p.swN || 0) + 1;
+      p._lastSw = p.swT;
+      const stepIdx = Math.floor(p.run / Math.PI);
+      if (p._step !== undefined && stepIdx !== p._step && p.onGround && Math.abs(p.vx) > 1.5) SFX.step(q.x);
+      p._step = stepIdx;
+      const accX = (p.vx - (p._pvx === undefined ? p.vx : p._pvx)) / Math.max(dt, 1e-3); p._pvx = p.vx; p._sq = (p._sq || 0) - dt;
+      if (p.onGround && Math.abs(accX) > 24 && Math.abs(p.vx) > 1 && p._sq <= 0) { SFX.squeak(q.x); p._sq = 0.7; }
       const ps = G3.pShadows[p.side]; ps.position.set(q.x + d * 0.05, 0.027, ROOTZ); const pk = clamp(1 - q.y / 1.5, 0.4, 1); ps.scale.setScalar(pk); ps.material.opacity = 0.7 * pk;
       poseHuman(hm, { x: q.x, y: q.y, z: ROOTZ, d, vx: p.vx, onGround: p.onGround, run: p.run, swT: p.swT, swOver: p.swOver, hitT: p.hitT, hitPos: p.hitPos,
-        holding, tossing, ball: ballV, look: ballV || V3(0, 1, 0), prep, celebrate, t, dt });
+        holding, tossing, heldW: holding && vb ? V3(vb.x, vb.y, BALLZ) : null, swId: p.swN || 0, ball: ballV, look: ballV || V3(0, 1, 0), prep, celebrate, t, dt });
     }
     // ball
     if (vb) {
@@ -1651,7 +2131,7 @@ function render3D(dt, t) {
     const tr = game.ball.trail;
     for (let i = 0; i < G3.trail.length; i++) {
       const m = G3.trail[i], pnt = tr[tr.length - 2 - i];
-      if (pnt && vb && !vb.held && Math.abs(vb.vx || 0) > 5) { m.visible = true; m.position.set(pnt.x, pnt.y, BALLZ); m.material.opacity = 0.42 * (1 - i / G3.trail.length); m.scale.setScalar(1 - i * 0.1); }
+      if (pnt && vb && !vb.held && Math.abs(vb.vx || 0) > 28 && i < 3) { m.visible = true; m.position.set(pnt.x, pnt.y, BALLZ); m.material.opacity = 0.14 * (1 - i / 3); m.scale.setScalar(0.9); } // svak bevegelsesuskarphet bare for svært raske baller
       else m.visible = false;
     }
     // TV-kamera: rammer inn begge spillerne (og ballen), zoomer inn når det er plass
@@ -1823,7 +2303,7 @@ function loop(t) {
 // ====================================================================
 //  Karakterbygger (3D-forhåndsvisning)
 // ====================================================================
-let editorOpen = false, edP = 0, edSwingT = 0, edNext = 2;
+let editorOpen = false, edP = 0, edSwingT = 0, edNext = 2, edSwingN = 0;
 const edCanvas = document.getElementById('edCanvas');
 const avatar = document.getElementById('avatar'), avCtx = avatar.getContext('2d');
 const ED_ROWS = [
@@ -1875,12 +2355,12 @@ function renderEditorFrame(look, t, dt, swT, turn) {
   if (!initEditorGL()) return;
   edEnsureHuman(look);
   G3.edPivot.rotation.y = turn;
-  poseHuman(G3.edHuman, { x: 0, y: 0, z: 0, d: 1, yaw: 0, vx: 0, onGround: true, run: 0, swT, swOver: false, hitT: -1, ball: null, look: V3(3, 1.5, 0), t, dt });
+  poseHuman(G3.edHuman, { x: 0, y: 0, z: 0, d: 1, yaw: 0, vx: 0, onGround: true, run: 0, swT, swOver: false, hitT: -1, swId: edSwingN, ball: null, look: V3(3, 1.5, 0), t, dt });
   G3.edRenderer.render(G3.edScene, G3.edCamera);
 }
 function drawEditorPreview(t, dt) {
   if (edSwingT > 0) { edSwingT += dt; if (edSwingT > SW_DUR) edSwingT = 0; }
-  else if (t > edNext) { edSwingT = 0.0001; edNext = t + 3; }
+  else if (t > edNext) { edSwingT = 0.0001; edSwingN++; edNext = t + 3; }
   renderEditorFrame(looks[edP], t, dt, edSwingT, -0.9 + Math.sin(t * 0.5) * 0.6);
 }
 function drawAvatar() {
@@ -1952,7 +2432,7 @@ const BROKERS = [
   { url: 'wss://test.mosquitto.org:8081/mqtt' },
   { url: 'wss://broker.hivemq.com:8884/mqtt' },
 ];
-const VERSION = '3.5';
+const VERSION = '3.6';
 function makeRelayRoom() {
   const myPeer = 'p' + Math.random().toString(36).slice(2, 10);
   let mine = {}, other = null, clients = [], topic = null, lastSend = 0, pending = false, seq = 0, otherSeq = -1, lockPeer = null, waiter = null, wasConn = false;
@@ -2316,7 +2796,7 @@ function updateRemote(dt) {
   if (sw > 0) { p.swT = sw / 1000 + since; if (p.swT > SW_DUR) p.swT = 0; p.hitT = ht > 0 ? ht / 1000 : -1; p.hitDone = ht > 0; }
   else { p.swT = 0; p.hitT = -1; p.hitDone = false; }
   // --- slaglyder i takt med bildet ---
-  while (R.fxq.length && R.fxq[0].ts <= rtB) { const f = R.fxq.shift(); if (f.smash) { SFX.smash(); game.shake = 0.4; G3.cheer(0.8); const vb = game.rb || game.ball; game.popup = { t: 0.9, x: vb.x, y: vb.y, txt: 'SMASH!' }; } else SFX.hit(); }
+  while (R.fxq.length && R.fxq[0].ts <= rtB) { const f = R.fxq.shift(); const vb = game.rb || game.ball; if (f.smash) { SFX.smash(vb.x); game.shake = 0.4; G3.cheer(0.8); game.popup = { t: 0.9, x: vb.x, y: vb.y, txt: 'SMASH!' }; } else SFX.hit(vb.x); }
   // --- ballen på motspillerens side ---
   if (game.ownBall) { R.simKey = ''; return; }
   let ev = null;
@@ -2340,7 +2820,7 @@ function updateRemote(dt) {
     }
   } else if (!R.sim.held) {
     const n = Math.max(1, Math.round(dt / STEP));
-    for (let i = 0; i < n; i++) physStep(R.sim, dt / n, e => { if (e === 'bounce') { SFX.bounce(); G3.bounceMark(R.sim.x); } if (e === 'net') SFX.net(); });
+    for (let i = 0; i < n; i++) physStep(R.sim, dt / n, e => { if (e === 'bounce') { SFX.bounce(R.sim.x, Math.abs(R.sim.vy) / 0.74); G3.bounceMark(R.sim.x); } if (e === 'net') SFX.net(R.sim.x); });
   }
   const dk = Math.pow(0.002, dt);
   game.rbErr.x *= dk; game.rbErr.y *= dk;
@@ -2382,7 +2862,7 @@ function segInit(id, key, onChange) {
     if (onChange) onChange();
   });
 }
-segInit('segGames', 'games'); segInit('segDiff', 'diff'); segInit('segGfx', 'gfx', () => { PERF.dyn = 1; applyQuality(); });
+segInit('segGames', 'games'); segInit('segDiff', 'diff'); segInit('segSound', 'sound', () => { audioInit(); setSoundVolume(); }); segInit('segGfx', 'gfx', () => { PERF.dyn = 1; applyQuality(); });
 nameIn.addEventListener('input', () => { store.set('name', nameIn.value); if (!game) sendLobby(); });
 function saveSettings() { store.set('name', nameIn.value); }
 
@@ -2442,7 +2922,7 @@ function onEscape() {
 }
 
 // Testkrok
-window.__tennis = { get game() { return game; }, NET, settings, looks, G3, CAM, sim(sec) { for (let t = 0; t < sec; t += 1 / 60) update(1 / 60); } };
+window.__tennis = { get game() { return game; }, NET, settings, looks, G3, CAM, r3: (dt, t) => render3D(dt, t), sim(sec) { for (let t = 0; t < sec; t += 1 / 60) update(1 / 60); } };
 
 // ====================================================================
 //  Start
