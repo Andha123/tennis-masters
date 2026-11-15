@@ -135,8 +135,8 @@
         <div class="keys">
           <span><kbd>A</kbd><kbd>D</kbd> / <kbd>←</kbd><kbd>→</kbd></span><span>Løp frem og tilbake</span>
           <span><kbd>W</kbd> / <kbd>↑</kbd></span><span>Hopp</span>
-          <span><kbd>X</kbd></span><span>Slå – trykk når ballen nærmer seg racketen. Også serve: X kaster opp, X slår</span>
-          <span><kbd>C</kbd></span><span>Smash – kraftig slag ovenfra når ballen er over hodet (hopp med W for å nå høyere). Lynrask og bratt, spretter høyt</span>
+          <span><kbd>X</kbd></span><span>Slå – trykk når ballen nærmer seg racketen. Best i hoftehøyde: lav ball blir kort og kan gå i nettet, ball i skulderhøyde blir flat og lang, og over skulderen blir det feil. Også serve: X kaster opp, X slår</span>
+          <span><kbd>C</kbd></span><span>Smash – bare når ballen er over hodet (hopp med W for å nå høyere). Lynrask og bratt, spretter høyt. På en ball i brysthøyde blir det feiltreff, og på en lav ball bommer du helt</span>
           <span>Retning</span><span>Hold <b>mot nettet</b> = hard topspin · hold <b>bakover</b> = lobb (høy og dyp – gir motspilleren sjansen til smash)</span>
           <span>Samme tastatur</span><span>Venstre: <kbd>A</kbd><kbd>D</kbd><kbd>W</kbd> slå <kbd>X</kbd> smash <kbd>C</kbd> · Høyre: piltaster, slå <kbd>L</kbd> smash <kbd>K</kbd></span>
           <span>Regler</span><span>Vanlig tennistelling. Serven må lande i serveruten (mellom nettet og servelinjen). To feil = dobbeltfeil.</span>
@@ -214,6 +214,8 @@ const NETH = 0.92;            // netthøyde midt på
 const G = 9.81, BR = 0.045;   // gravitasjon, ballradius (litt større enn ekte for synlighet)
 const PG = 13, PSPEED = 7.2, JUMPV = 3.7;
 const SW_DUR = 0.44, SW_ACTIVE = 0.22;
+// treffhøyder (meter over føttene): smash fra 1,65 m, feiltreff-smash fra 1,15 m, vanlig slag opp til 1,78 m
+const SMASH_MIN = 1.65, SMASH_BAD = 1.15, HIT_MAX = 1.78;
 const STEP = 1 / 240;
 const XRANGE = [[-14.6, -0.55], [0.55, 14.6]];
 const OFFX = 22;
@@ -692,15 +694,37 @@ function tryHit(p, mod) {
   const Z = zones(p);
   const inH = inZone(b, Z.hit), inS = inZone(b, Z.smash);
   if (!inH && !inS) return;
-  let kind, z;
-  if (b.hitter === -1) { if (inS) { kind = 'serveHard'; z = Z.smash; } else { kind = 'serve'; z = Z.hit; } }
-  else if (p.swK === 'smash' && inS) { kind = 'smash'; z = Z.smash; }
-  else if (inH) { kind = p.swK === 'smash' ? 'drive' : 'hit'; z = Z.hit; }
-  else { kind = 'hit'; z = Z.smash; }
+  const { kind, z } = chooseKind(p, b, Z, inH, inS);
   const dist = Math.hypot(b.x - z.x, b.y - z.y);
   const nd = Math.hypot(b.x + b.vx * STEP - z.x, b.y + b.vy * STEP - z.y);
   if (nd < dist - 1e-4 && p.swT < SW_ACTIVE - STEP * 1.5) return;
-  doHit(p, kind, clamp(dist / z.r, 0, 1), mod);
+  if (kind === 'whiff') { // bom: racketen går over ballen
+    p.hitDone = true; p.hitT = p.swT;
+    hintPopup(p, b, 'Bom! For lav for smash');
+    return;
+  }
+  doHit(p, kind, clamp(dist / z.r, 0, 1), mod, z);
+}
+function chooseKind(p, b, Z, inH, inS) {
+  let kind, z;
+  const h = b.y - p.y; // treffhøyde over føttene
+  if (b.hitter === -1) { if (inS) { kind = 'serveHard'; z = Z.smash; } else { kind = 'serve'; z = Z.hit; } }
+  else if (p.swK === 'smash') {
+    // smash (C) virker bare på høye baller; for lavt = feiltreff, helt lavt = svingen går over ballen
+    if (inS && h >= SMASH_MIN) { kind = 'smash'; z = Z.smash; }
+    else if (h >= SMASH_BAD) { kind = 'badSmash'; z = inH ? Z.hit : Z.smash; }
+    else { kind = 'whiff'; z = Z.hit; }
+  } else {
+    // vanlig slag (X) på en ball over skulderhøyde blir et feilslag
+    if (inH && h <= HIT_MAX) { kind = 'hit'; z = Z.hit; }
+    else { kind = 'highMiss'; z = Z.smash; }
+  }
+  return { kind, z };
+}
+// liten forklaring over ballen når en lokal spiller velger feil slag
+function hintPopup(p, b, txt) {
+  if (game.control[p.side] === 'cpu' || game.control[p.side] === 'remote') return;
+  game.popup = { t: 0.9, x: b.x, y: b.y, txt, small: true };
 }
 
 // Finn utgangsfarten som lander ballen på målet med samme fysikk som spillet bruker (skyting + halvering).
@@ -720,27 +744,62 @@ function solveShot(b, d, tx, speed, sp, margin) {
   return { vx, vy };
 }
 
-function doHit(p, kind, q, mod) {
+function doHit(p, kind, q, mod, z) {
   const b = game.ball, s = p.side, d = dirOf(s);
+  const h = b.y - p.y, inc = Math.abs(b.vx);
   // svært raske innkommende baller (smash/kraftslag) er vanskelige å kontrollere
-  const inc = Math.abs(b.vx);
-  if (b.hitter !== -1 && inc > 28) { q = Math.max(q, clamp((inc - 28) / 16, 0, 0.9)); if (inc > 34 && (kind === 'smash' || kind === 'drive')) kind = 'hit'; }
-  let tx, speed, sp, err, margin = 0.25 + (1 - q) * 0.3;
+  if (b.hitter !== -1 && inc > 28) { q = Math.max(q, clamp((inc - 28) / 16, 0, 0.9)); if (inc > 34 && kind === 'smash') kind = 'badSmash'; }
+  let tx, speed, sp, err, margin = 0.25 + (1 - q) * 0.3, netRisk = 0;
   switch (kind) {
-    case 'smash':     tx = d * BASE * clamp(0.47 + 0.12 * mod, 0.3, 0.75); speed = 46 + 2 * mod; sp = 0.1; err = 0.3 + q * q * 2.6 + Math.max(0, Math.abs(b.x) - 7) * 0.18; margin = 0.1; break;
-    case 'drive':     tx = d * BASE * 0.86; speed = 34; sp = 0.12; err = 0.55 + q * q * 5; margin = 0.08 + (1 - q) * 0.15; break;
+    case 'smash': { // best høyt over hodet; lavere treff gir flatere, svakere og mer usikker smash
+      const hs = clamp((h - SMASH_MIN) / 0.7, 0, 1);
+      tx = d * BASE * clamp(0.47 + 0.22 * (1 - hs) + 0.12 * mod, 0.3, 0.8); speed = 39 + 7 * hs + 2 * mod; sp = 0.1;
+      err = 0.3 + 0.9 * (1 - hs) + q * q * 2.6 + Math.max(0, Math.abs(b.x) - 7) * 0.18; margin = 0.1; break;
+    }
+    case 'badSmash': // smash på en ball i brysthøyde: feiltreff, som regel i nettet eller langt ut
+      if (Math.random() < 0.5) { tx = d * BASE * 0.12; speed = 30; sp = 0.05; err = 1; margin = -1; } // slått rett ned i nettet
+      else { tx = d * BASE * (1.2 + 0.2 * Math.random()); speed = 34 + 6 * Math.random(); sp = 0.05; err = 3; margin = 0; } // flyr langt ut
+      hintPopup(p, b, 'For lav for smash!'); break;
+    case 'highMiss': { // vanlig slag over skulderen: racketen kommer ikke over ballen
+      const over = clamp((h - HIT_MAX) / 0.6, 0, 1);
+      if (Math.random() < 0.9) { tx = d * BASE * (1.28 + 0.14 * over); speed = 23 + 6 * Math.random(); sp = 0.08; err = 2.6 + 2 * over; margin = 0.05; netRisk = 0.5; } // går langt
+      else { tx = d * BASE * 0.55; speed = 17; sp = 0.1; err = 1; }                                                                                         // svak ball midt i banen
+      hintPopup(p, b, 'For høyt! Bruk smash (C)'); break;
+    }
     case 'serve':     tx = d * SERVICE * clamp(0.72 + 0.12 * mod, 0.4, 0.92); speed = 30; sp = 0.35; err = 0.2 + q * q * 1.4; margin = 0.1 + (1 - q) * 0.15; break;
     case 'serveHard': tx = d * SERVICE * clamp(0.76 + 0.1 * mod, 0.4, 0.92); speed = 38; sp = 0.15; err = 0.3 + q * q * 2.0; margin = 0.08 + (1 - q) * 0.15; break;
-    default:
-      if (b.y > p.y + 1.8) { tx = d * BASE * 0.62; speed = 19; sp = 0.2; err = 0.35 + q * q * 2.5; } // høy ball tatt med vanlig slag: kontrollert volley
-      else if (mod < 0) { tx = d * BASE * 0.85; speed = 13.5; sp = 0.3; err = 0.45 + q * q * 3; margin = 1.2; } // lobb: høy og dyp – gir motspilleren sjansen til smash
-      else if (mod > 0) { tx = d * BASE * 0.82; speed = 31; sp = 0.85;  err = 0.45 + q * q * 4; }   // hard topspin
-      else              { tx = d * BASE * 0.7;  speed = 26; sp = 0.55;  err = 0.4 + q * q * 3.4; } // vanlig topspin
+    default: {
+      let depth;
+      if (mod < 0)      { depth = 0.85; speed = 13.5; sp = 0.3;  err = 0.45 + q * q * 3; margin = 1.2; } // lobb: høy og dyp – gir motspilleren sjansen til smash
+      else if (mod > 0) { depth = 0.82; speed = 31;   sp = 0.85; err = 0.45 + q * q * 4; }               // hard topspin
+      else              { depth = 0.7;  speed = 26;   sp = 0.55; err = 0.4 + q * q * 3.4; }              // vanlig topspin
+      // treffhøyde: hoftehøyde er best. Lav ball må løftes (kortere, saktere, mer nett), skulderhøyde blir flatt og usikkert
+      const low = clamp((0.6 - h) / 0.45, 0, 1), high = clamp((h - 1.15) / 0.63, 0, 1);
+      speed *= 1 - 0.3 * low + 0.06 * high; sp *= 1 - 0.55 * low - 0.5 * high; depth *= 1 - 0.28 * low + 0.3 * high;
+      err += 1.2 * low + 3.2 * high * high; margin += 0.25 * low; netRisk += 2.2 * low * low + 0.4 * high;
+      // ballens bevegelse: stigende ball (rett etter sprett) gir fart men er vanskelig; fallende ball etter toppen er lettest
+      const volley = b.bounces === 0;
+      if (volley) { speed *= 0.82; depth *= 0.85; sp *= 0.4; err += 0.2 + 0.8 * low; netRisk += 1.2 * low * low; }
+      else if (b.vy > 1.2) { const r = clamp(b.vy / 5, 0, 1.3); speed *= 1 + 0.1 * r; depth *= 1 + 0.12 * r; err += 2.0 * r; netRisk += 1.0 * r; } // på vei opp
+      else if (b.vy < 0) err = Math.max(0.2, err - 0.15);
+      // fart inn: brukes videre, men blir vanskeligere å styre
+      speed *= 1 + clamp((inc - 18) * 0.008, 0, 0.18); err += clamp((inc - 22) * 0.2, 0, 2.5); depth *= 1 + clamp((inc - 22) * 0.012, 0, 0.15); netRisk += clamp((inc - 26) * 0.1, 0, 1);
+      // treffpunkt foran (tidlig) eller bak (sent) kroppen
+      const ex = z ? clamp((b.x - z.x) * d / z.r, -1, 1) : 0;
+      depth *= 1 + 0.14 * ex; speed *= 1 + 0.05 * ex; err += 1.2 * Math.max(0, ex - 0.3);
+      if (ex < -0.2) { netRisk += 3.5 * (-ex - 0.2); err += -ex; }
+      // i løp og i luften
+      err += Math.max(0, Math.abs(p.vx) - 3) * 0.25 + (p.onGround ? 0 : 0.8);
+      tx = d * BASE * depth;
+    }
   }
+  // datamaskinens ferdighet: vanskeligere nivå treffer jevnere (gjelder ikke feil valg av slag)
+  if (game.control[s] === 'cpu' && kind === 'hit') { const sk = [1, 0.75, 0.55][game.diff] || 1; err *= sk; netRisk *= sk; q *= sk; }
   speed *= 0.96 + Math.random() * 0.08;
   tx += gauss() * err;
   const sol = solveShot(b, d, tx, speed, sp, margin);
-  b.vx = sol.vx; b.vy = sol.vy + gauss() * q * q * 0.6; b.sp = sp; b.kick = kind === 'smash';
+  b.vx = sol.vx; b.vy = sol.vy + gauss() * q * q * 0.6 - netRisk * 0.45 * Math.abs(gauss()); b.sp = sp; b.kick = kind === 'smash';
+  game.lastHitInfo = { kind, h: +h.toFixed(2), q: +q.toFixed(2), vol: b.bounces === 0 ? 1 : 0, vy: 0, inc: +inc.toFixed(1), pvx: +p.vx.toFixed(1), netRisk: +netRisk.toFixed(2), err: +err.toFixed(2), ex: z ? +clamp((b.x - z.x) * d / z.r, -1, 1).toFixed(2) : 0 };
   b.serve = b.hitter === -1;
   b.hitter = s; b.bounces = 0; b.hc++; b.lastSmash = kind === 'smash' || kind === 'serveHard';
   p.hitDone = true; p.hitT = p.swT;
@@ -750,7 +809,7 @@ function doHit(p, kind, q, mod) {
     if (game.mode !== 'online') game.hitstop = 0.075;
     game.popup = { t: 0.9, x: b.x, y: b.y, txt: 'SMASH!' };
   } else if (b.lastSmash) { SFX.serve(b.x); game.shake = 0.18; }
-  else if (kind === 'drive') { SFX.drive(b.x); game.shake = 0.08; }
+  else if (kind === 'badSmash') { SFX.drive(b.x); game.shake = 0.08; }
   else SFX.hit(b.x);
   game.hitFlash = { x: b.x, y: b.y, t: kind === 'smash' ? 0.3 : 0.16, big: kind === 'smash' };
   NET.fk = kind === 'smash' ? 1 : 0;
@@ -799,7 +858,7 @@ function predict(b, s, p, diff) {
     if (sideOfX(sim.x) !== s) continue;
     const h = sim.y;
     const reach = Math.abs(sim.x - d * 0.62 - p.x) / sp;
-    if (wantSmash && h > 2.0 && h < 3.2 && reach <= t - 0.1) return { x: sim.x + d * 0.34, t, jump: h > 2.85 };
+    if (wantSmash && h > 2.0 && h < 3.2 && reach <= t - 0.1) return { x: sim.x + d * 0.34, t, jump: h > 2.85, smash: true };
     if (h > 0.45 && h < 1.45 && reach <= t + 0.03) return { x: sim.x, t, jump: false };
     if (!fallback && h > 0.35 && h < 1.6) fallback = { x: sim.x, t, jump: false };
   }
@@ -823,6 +882,7 @@ function cpuInput(p, dt) {
     } else if (!b.held && b.hitter !== -1 && b.hitter !== s) {
       if (ai.planFor !== b.hc) {
         ai.planFor = b.hc; ai.plan = predict(b, s, p, diff);
+        ai.smartHigh = Math.random() < [0.6, 0.86, 0.97][game.diff]; // velger riktig slag (smash) på høye baller
         const fast = Math.max(0, Math.abs(b.vx) - 30);            // raske baller (smash) er vanskelige å reagere på
         ai.react = diff.react * (0.6 + Math.random() * 0.8) + fast * 0.04;
         ai.err = gauss() * (diff.err + fast * 0.1);
@@ -835,9 +895,11 @@ function cpuInput(p, dt) {
       }
       if (b.owner === s && game.ownBall && sideOfX(b.x) === s && p.swT === 0) {
         const nb = { x: b.x + b.vx * 0.06, y: b.y + b.vy * 0.06 };
-        if ((inZone(nb, Z.smash) || inZone(b, Z.smash)) && b.y > p.y + 1.9 && Math.random() < 0.3 + diff.smash) inp.smash = true;
-        else if (inZone(nb, Z.hit) || inZone(b, Z.hit)) inp.hit = true;
-        else if (inZone(nb, Z.smash) || inZone(b, Z.smash)) inp.hit = true;
+        const inS = inZone(nb, Z.smash) || inZone(b, Z.smash), inH = inZone(nb, Z.hit) || inZone(b, Z.hit), hh = b.y - p.y;
+        const high = () => { if (ai.smartHigh) inp.smash = true; else inp.hit = true; };
+        if (inS && hh > SMASH_MIN + 0.05 && ai.plan && ai.plan.smash) high();
+        else if (inH && hh <= HIT_MAX - 0.08) inp.hit = true;
+        else if (inS && hh > HIT_MAX && (!ai.plan || ai.plan.smash || b.vy > 0)) high();
       }
     }
   }
@@ -2239,9 +2301,9 @@ function drawHUD() {
       const pt = projectToHud(pu.x, pu.y + 0.4 + (0.9 - pu.t) * 1.2, BALLZ);
       const k = clamp(pu.t / 0.9, 0, 1), pop = 1 + (1 - Math.min(1, (0.9 - pu.t) / 0.12)) * 0.6;
       g.save(); g.globalAlpha = Math.min(1, k * 2); g.translate(pt.x, pt.y); g.scale(pop, pop); g.rotate(-0.08);
-      g.font = 'italic 900 46px "Barlow Condensed", Arial, sans-serif'; g.textAlign = 'center';
-      g.lineWidth = 7; g.strokeStyle = 'rgba(8,16,30,.85)'; g.strokeText(pu.txt, 0, 0);
-      g.fillStyle = '#ffd23f'; g.fillText(pu.txt, 0, 0); g.restore();
+      g.font = `italic 900 ${pu.small ? 30 : 46}px "Barlow Condensed", Arial, sans-serif`; g.textAlign = 'center';
+      g.lineWidth = pu.small ? 6 : 7; g.strokeStyle = 'rgba(8,16,30,.85)'; g.strokeText(pu.txt, 0, 0);
+      g.fillStyle = pu.small ? '#ffffff' : '#ffd23f'; g.fillText(pu.txt, 0, 0); g.restore();
     }
   }
   // store meldinger
@@ -2432,7 +2494,7 @@ const BROKERS = [
   { url: 'wss://test.mosquitto.org:8081/mqtt' },
   { url: 'wss://broker.hivemq.com:8884/mqtt' },
 ];
-const VERSION = '3.6';
+const VERSION = '3.7';
 function makeRelayRoom() {
   const myPeer = 'p' + Math.random().toString(36).slice(2, 10);
   let mine = {}, other = null, clients = [], topic = null, lastSend = 0, pending = false, seq = 0, otherSeq = -1, lockPeer = null, waiter = null, wasConn = false;
@@ -2922,7 +2984,27 @@ function onEscape() {
 }
 
 // Testkrok
-window.__tennis = { get game() { return game; }, NET, settings, looks, G3, CAM, r3: (dt, t) => render3D(dt, t), sim(sec) { for (let t = 0; t < sec; t += 1 / 60) update(1 / 60); } };
+function dbgShot(o) {
+  const p = game.players[0], d = dirOf(0), b = game.ball, Z = zones(p);
+  p.swK = o.sw || 'hit';
+  Object.assign(b, { held: false, hitter: 1, owner: 0, bounces: o.volley ? 0 : 1, serve: false, kick: false, sp: 0 });
+  b.x = p.x + d * (0.62 + (o.ex || 0) * 0.5); b.y = p.y + o.h; b.vx = -d * (o.inc || 18); b.vy = o.vy == null ? -2 : o.vy;
+  p.vx = o.pvx || 0;
+  const inH = inZone(b, Z.hit), inS = inZone(b, Z.smash);
+  const { kind, z } = chooseKind(p, b, Z, inH || o.h < 1.8, inS || o.h > 1.6);
+  if (kind === 'whiff') return { kind, res: 'whiff' };
+  doHit(p, kind, o.q || 0.2, o.mod || 0, z);
+  const sim = { x: b.x, y: b.y, vx: b.vx, vy: b.vy, sp: b.sp, kick: b.kick, spin: 0 }, v0 = Math.hypot(b.vx, b.vy);
+  let res = null, apex = sim.y, netY = null;
+  for (let i = 0; i < 1200 && !res; i++) { const px = sim.x; physStep(sim, 1 / 120, e => {
+    if (res) return;
+    if (e === 'net') res = 'net';
+    else if (e === 'bounce') res = sideOfX(sim.x) === 0 ? 'net' : Math.abs(sim.x) <= BASE + BR * 0.5 ? 'in' : 'out';
+    else if (e === 'off') res = 'out';
+  }); apex = Math.max(apex, sim.y); if (px * sim.x < 0 && netY === null) netY = sim.y; }
+  return { kind, res: res || 'net', land: Math.abs(sim.x), v0, apex, netY };
+}
+window.__tennis = { get game() { return game; }, NET, settings, looks, G3, CAM, dbgShot, r3: (dt, t) => render3D(dt, t), sim(sec) { for (let t = 0; t < sec; t += 1 / 60) update(1 / 60); } };
 
 // ====================================================================
 //  Start

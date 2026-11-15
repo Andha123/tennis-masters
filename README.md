@@ -20,7 +20,7 @@ Et realistisk 3D-tennisspill i nettleseren, sett fra siden som på TV. Spill mot
 | A / D eller ← / → | Løp frem og tilbake |
 | W eller ↑ | Hopp |
 | **X** | Slå (og serve: X kaster opp ballen, X igjen slår) |
-| **C** | Smash: kraftig slag ovenfra når ballen er over hodet (hopp med W for å nå høyere). Lynrask, bratt og spretter høyt |
+| **C** | Smash: kraftig slag ovenfra, bare når ballen er over hodet (hopp med W for å nå høyere). Lynrask, bratt og spretter høyt. Smash på en ball i brysthøyde blir feiltreff, og på en lav ball bommer du |
 | Hold mot nettet når du slår | Hard topspin, langt |
 | Hold bakover når du slår | Lobb, høy og dyp. Gir motspilleren sjansen til smash |
 | Esc | Pause / meny |
@@ -33,6 +33,13 @@ To på samme tastatur: venstre spiller bruker A/D/W, X og C, mens høyre spiller
 - Serven må lande i serveruten. To feil gir dobbeltfeil.
 - Ballen har luftmotstand og spinn (Magnus-effekt). Topspin dykker og spretter høyt. En smash går over 40 m/s, treffer bratt og spretter høyt opp.
 - Banen har ekte mål: 23,77 m lang, med nett på 0,914 m.
+
+## Treffhøyde
+
+- **Vanlig slag (X)** er best i hoftehøyde. En lav ball må løftes og blir kortere og saktere, og kan gå i nettet. En ball i skulderhøyde blir flat og lang. Over skulderen blir det feilslag (som regel langt ut). Bruk smash der.
+- En ball som fortsatt er på vei opp etter spretten gir fart, men er vanskeligere å styre. En ball som er på vei ned etter toppen er lettest.
+- Volley (før spretten) blir kortere og roligere. Sent treff (ballen bak kroppen) går lettere i nettet, tidlig treff går lengre. Rask ball inn og slag i fullt løp gir mindre presisjon.
+- **Smash (C)** virker fra rundt hodehøyde og oppover: jo høyere, jo brattere og hardere.
 
 ## Spillerne
 
